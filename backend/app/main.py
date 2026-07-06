@@ -320,7 +320,8 @@ INDEX_HTML = """
 
       agentEl.textContent = JSON.stringify({
         validator: latest.last_validator_result || null,
-        agent: latest.last_agent_trace || null
+        agent: latest.last_agent_trace || null,
+        director: latest.last_director_trace || null
       }, null, 2);
 
       relationshipsEl.textContent = Object.values(latest.relationships || {}).map(rel =>
@@ -496,6 +497,8 @@ async def get_agent_state(world_id: str) -> dict[str, Any]:
         "action_queue": snapshot["action_queue"],
         "last_validator_result": snapshot["last_validator_result"],
         "last_agent_trace": snapshot["last_agent_trace"],
+        "last_director_trace": snapshot["last_director_trace"],
+        "director_state": snapshot["director_state"],
         "last_relationship_change": snapshot["last_relationship_change"],
     }
 

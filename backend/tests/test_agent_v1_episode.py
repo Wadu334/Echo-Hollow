@@ -143,7 +143,7 @@ class AgentV1EpisodeTests(unittest.TestCase):
         world.move_player("workshop")
         world.share_claim(target_id="mira", claim_id="tomo_took_seeds")
 
-        world.wait_minutes(95)
+        world.wait_minutes(185)
         snapshot = world.snapshot()
 
         self.assertEqual(snapshot["episode_phase"], "resolved_false_accusation")

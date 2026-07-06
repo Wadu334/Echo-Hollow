@@ -54,11 +54,14 @@ class GodotClientContractTests(unittest.TestCase):
             "action_queue",
             "last_validator_result",
             "last_agent_trace",
+            "last_director_trace",
+            "director_state",
         ]:
             self.assertIn(key, diff)
         self.assertIn("mira", diff["memories"])
         self.assertIn("mira->tomo", diff["relationships"])
-        self.assertEqual(diff["last_agent_trace"]["decision"], "action_queued")
+        self.assertEqual(diff["last_agent_trace"]["decision"], "action_proposed")
+        self.assertEqual(diff["last_director_trace"]["decisions"][-1]["decision_type"], "approve")
         self.assertTrue(any(action["tool_name"] == "npc_talk_to" for action in diff["action_queue"]))
 
 

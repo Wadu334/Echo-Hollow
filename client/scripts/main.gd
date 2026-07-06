@@ -122,6 +122,8 @@ func _merge_world_diff(diff: Dictionary) -> void:
 		"rumors",
 		"last_validator_result",
 		"last_agent_trace",
+		"last_director_trace",
+		"director_state",
 		"last_relationship_change",
 	]:
 		if diff.has(key):

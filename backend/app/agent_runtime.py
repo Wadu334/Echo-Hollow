@@ -67,7 +67,7 @@ class AgentRuntimeV1:
         self.ttl_minutes = ttl_minutes
         self._cooldowns: dict[str, int] = {}
 
-    def run_step(
+    def propose_step(
         self,
         world: Any,
         actor_id: str,
@@ -109,77 +109,68 @@ class AgentRuntimeV1:
                 public_reason=proposal.reason,
             )
 
-        cooldown_key = self._cooldown_key(proposal)
-        now = int(context["world_minute"])
-        if self._cooldowns.get(cooldown_key, -99999) + self.cooldown_minutes > now:
-            steps.append(
-                AgentRuntimeStep(
-                    phase="propose",
-                    summary="Skipped proposal because the same action is on cooldown.",
-                    proposal=proposal.to_dict(),
-                )
+        steps.append(
+            AgentRuntimeStep(
+                phase="propose",
+                summary="Selected the highest utility deterministic action proposal for Director review.",
+                proposal=proposal.to_dict(),
             )
-            return AgentRuntimeDecision(
-                actor_id=actor_id,
-                decision="cooldown_skipped",
-                context=context,
-                steps=steps,
-                tool_proposal=proposal,
-                queued_action_id=None,
-                public_reason="The runtime avoided repeating the same action too quickly.",
-            )
+        )
+        return AgentRuntimeDecision(
+            actor_id=actor_id,
+            decision="action_proposed",
+            context=context,
+            steps=steps,
+            tool_proposal=proposal,
+            queued_action_id=None,
+            public_reason=proposal.reason,
+        )
 
-        if world.has_pending_action(proposal.actor_id, proposal.tool_name, proposal.args):
-            steps.append(
-                AgentRuntimeStep(
-                    phase="validate",
-                    summary="Skipped proposal because an equivalent queued action already exists.",
-                    proposal=proposal.to_dict(),
-                )
-            )
-            return AgentRuntimeDecision(
-                actor_id=actor_id,
-                decision="duplicate_skipped",
-                context=context,
-                steps=steps,
-                tool_proposal=proposal,
-                queued_action_id=None,
-                public_reason="The action queue already contains this intent.",
-            )
+    def run_step(
+        self,
+        world: Any,
+        actor_id: str,
+        triggering_memory: Any | None = None,
+    ) -> AgentRuntimeDecision:
+        """Backward-compatible wrapper that routes scheduling through Director when present."""
+        decision = self.propose_step(world, actor_id, triggering_memory)
+        if decision.tool_proposal is None:
+            return decision
 
+        director = getattr(world, "director", None)
+        if director is not None:
+            director_decision = director.review_agent_decision(world, decision)
+            if director_decision.queued_action_ids:
+                return AgentRuntimeDecision(
+                    actor_id=decision.actor_id,
+                    decision="action_queued",
+                    context=decision.context,
+                    steps=decision.steps,
+                    tool_proposal=decision.tool_proposal,
+                    queued_action_id=director_decision.queued_action_ids[0],
+                    public_reason=decision.public_reason,
+                )
+            return decision
+
+        proposal = decision.tool_proposal
         action_id = world.enqueue_action(
             actor_id=proposal.actor_id,
             tool_name=proposal.tool_name,
             args=proposal.args,
             priority=proposal.priority,
-            execute_after_minute=now,
-            expires_at_minute=now + self.ttl_minutes,
+            execute_after_minute=int(decision.context["world_minute"]),
+            expires_at_minute=int(decision.context["world_minute"]) + self.ttl_minutes,
             source_memory_ids=proposal.source_memory_ids,
             reason=proposal.reason,
         )
-        self._cooldowns[cooldown_key] = now
-        steps.append(
-            AgentRuntimeStep(
-                phase="propose",
-                summary="Selected the highest utility deterministic action proposal.",
-                proposal=proposal.to_dict(),
-            )
-        )
-        steps.append(
-            AgentRuntimeStep(
-                phase="validate",
-                summary="Queued the proposal for the world validator; execution happens on world tick.",
-                observation=f"Queued action {action_id}.",
-            )
-        )
         return AgentRuntimeDecision(
-            actor_id=actor_id,
+            actor_id=decision.actor_id,
             decision="action_queued",
-            context=context,
-            steps=steps,
+            context=decision.context,
+            steps=decision.steps,
             tool_proposal=proposal,
             queued_action_id=action_id,
-            public_reason=proposal.reason,
+            public_reason=decision.public_reason,
         )
 
     def assemble_context(

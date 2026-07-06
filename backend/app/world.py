@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .agent_runtime import AgentRuntimeV1
+from .director import VillageDirector
 from .episode import MissingSeedsEpisodeManager
 
 
@@ -245,6 +246,7 @@ class WorldSimulation:
         self._npc_schedule_locks: dict[str, int] = {}
         self.action_queue: dict[str, QueuedAction] = {}
         self.agent_runtime = AgentRuntimeV1()
+        self.director = VillageDirector()
         self.episode_manager = MissingSeedsEpisodeManager()
         self._event_counter = 0
         self._memory_counter = 0
@@ -252,6 +254,7 @@ class WorldSimulation:
         self._event_log: list[EventLogEntry] = []
         self.last_validator_result: dict[str, Any] | None = None
         self.last_agent_trace: dict[str, Any] | None = None
+        self.last_director_trace: dict[str, Any] | None = None
         self.last_relationship_change: dict[str, Any] | None = None
         self._append_event(
             event_type="world_started",
@@ -469,6 +472,7 @@ class WorldSimulation:
                     },
                 )
 
+        self.director.on_tick(self)
         changed_actor_ids.extend(self._execute_due_actions())
         self.episode_manager.on_tick(self)
 
@@ -712,12 +716,13 @@ class WorldSimulation:
             return self._rejection("actor_not_found", {"actor_id": actor_id})
 
         triggering_memory = self._latest_relevant_memory(actor_id)
-        decision = self.agent_runtime.run_step(self, actor_id, triggering_memory)
+        decision = self.agent_runtime.propose_step(self, actor_id, triggering_memory)
         self.last_agent_trace = decision.to_dict()
+        director_decision = self.director.review_agent_decision(self, decision)
         self._append_event(
             event_type="agent_runtime_step",
             actor_id=actor_id,
-            target_id=decision.queued_action_id,
+            target_id=director_decision.queued_action_ids[0] if director_decision.queued_action_ids else None,
             payload=self.last_agent_trace,
         )
         return self._diff(reason="autonomous_step", changed_actor_ids=[actor_id], latest_events_count=4)
@@ -762,6 +767,8 @@ class WorldSimulation:
             "action_queue": [action.to_dict() for action in self._sorted_actions()],
             "last_validator_result": self.last_validator_result,
             "last_agent_trace": self.last_agent_trace,
+            "last_director_trace": self.last_director_trace,
+            "director_state": self.director.to_dict(),
             "last_relationship_change": self.last_relationship_change,
             "latest_events": self.events(limit=8),
         }
@@ -1182,41 +1189,7 @@ class WorldSimulation:
         return self._diff(reason=validation["rejection_code"], changed_actor_ids=[], latest_events_count=1)
 
     def _plan_fallback_for_rejection(self, action: QueuedAction, validation: dict[str, Any]) -> None:
-        if validation.get("rejection_code") != "target_unavailable":
-            return
-
-        target_location: str | None = None
-        target_id = action.args.get("target_id")
-        subject_id = action.args.get("subject_id")
-        if target_id in self.npcs:
-            target_location = self.npcs[str(target_id)].current_location
-        elif subject_id in self.locations:
-            target_location = str(subject_id)
-
-        if not target_location or action.actor_id not in self.npcs:
-            return
-
-        self.enqueue_action(
-            actor_id=action.actor_id,
-            tool_name="npc_move_to",
-            args={"actor_id": action.actor_id, "location_id": target_location},
-            priority=action.priority + 1,
-            execute_after_minute=self.world_minute + 1,
-            expires_at_minute=self.world_minute + 30,
-            source_memory_ids=action.source_memory_ids,
-            reason=f"Fallback for {action.action_id}: move toward unavailable target.",
-            status="fallback_planned",
-        )
-        self.enqueue_action(
-            actor_id=action.actor_id,
-            tool_name=action.tool_name,
-            args=action.args,
-            priority=max(0, action.priority - 1),
-            execute_after_minute=self.world_minute + 2,
-            expires_at_minute=self.world_minute + 90,
-            source_memory_ids=action.source_memory_ids,
-            reason=f"Retry after fallback movement for {action.action_id}.",
-        )
+        self.director.on_action_rejected(self, action, validation)
 
     def _agent_planner_after_memory(self, memory: MemoryRecord) -> list[str]:
         if memory.owner_id not in self.npcs:
@@ -1254,14 +1227,7 @@ class WorldSimulation:
                 emotional_valence=-0.2 if cautious else -0.35,
             )
 
-        decision = self.agent_runtime.run_step(self, memory.owner_id, memory)
-        self.last_agent_trace = decision.to_dict()
-        self._append_event(
-            event_type="agent_action_planned",
-            actor_id=memory.owner_id,
-            target_id=decision.queued_action_id,
-            payload=self.last_agent_trace,
-        )
+        self.director.on_memory_written(self, memory)
         return changed_actor_ids
 
     def _change_relationship(
@@ -1470,6 +1436,8 @@ class WorldSimulation:
             "action_queue": snapshot["action_queue"],
             "last_validator_result": snapshot["last_validator_result"],
             "last_agent_trace": snapshot["last_agent_trace"],
+            "last_director_trace": snapshot["last_director_trace"],
+            "director_state": snapshot["director_state"],
             "last_relationship_change": snapshot["last_relationship_change"],
             "latest_events": self.events(limit=latest_events_count),
         }
