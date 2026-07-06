@@ -1,6 +1,6 @@
 # Godot Client
 
-This is a Godot 4.x display client for the deterministic MVP world server.
+This is the current Godot 4.x display client for the deterministic world server.
 
 ## Runtime Contract
 
@@ -8,6 +8,9 @@ The client expects the backend WebSocket to emit:
 
 - `world_state`
 - `world_diff`
+- `dialogue_opened`
+- `dialogue_result`
+- `interaction_denied`
 
 The payload fields consumed by `scripts/main.gd` are covered by `backend/tests/test_client_contract.py`.
 
@@ -28,6 +31,25 @@ Each key sends:
 }
 ```
 
+## Next Playable Client Contract
+
+The backend now supports the logical messages needed for a Stardew-like client:
+
+- `player_entered_location`
+- `player_interact_npc`
+- `dialogue_choice`
+- `investigate_location`
+- `wait_minutes`
+- `run_village_step`
+
+Godot should own WASD movement, collision, camera, local coordinates, animation, and NPC tweening. The backend owns logical location, interactions, memory, Director scheduling, and episode state.
+
 ## Current Verification Note
 
-The project files are ready for Godot 4.x, but this environment did not have a local Godot executable available. Backend protocol compatibility is covered by automated tests; final visual QA should be done by opening `project.godot` in Godot 4.x.
+Godot headless verification has passed with Godot 4.7 in this environment:
+
+```powershell
+godot_console --headless --path client --script res://tests/verify_client.gd
+```
+
+Manual visual QA should still be done by opening `project.godot` in Godot 4.x.

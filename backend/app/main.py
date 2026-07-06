@@ -372,45 +372,68 @@ class WorldHub:
         message_type = payload.get("type")
         async with self._lock:
             if message_type == "move_player":
-                diff = self.world.move_player(str(payload.get("location_id", "")))
+                result = self.world.move_player(str(payload.get("location_id", "")))
+            elif message_type == "player_entered_location":
+                result = self.world.player_entered_location(str(payload.get("location_id", "")))
+            elif message_type == "player_interact_npc":
+                result = self.world.player_interact_npc(
+                    npc_id=str(payload.get("npc_id", "")),
+                    interaction=str(payload.get("interaction", "talk")),
+                )
+            elif message_type == "dialogue_choice":
+                result = self.world.dialogue_choice(
+                    npc_id=str(payload.get("npc_id", "")),
+                    choice_id=str(payload.get("choice_id", "")),
+                )
             elif message_type == "observe":
-                diff = self.world.observe()
+                result = self.world.observe()
             elif message_type == "talk_to":
-                diff = self.world.talk_to(
+                result = self.world.talk_to(
                     target_id=str(payload.get("target_id", "")),
                     topic=str(payload.get("topic", "missing_seeds")),
                 )
             elif message_type == "share_claim":
-                diff = self.world.share_claim(
+                result = self.world.share_claim(
                     target_id=str(payload.get("target_id", "")),
                     claim_id=str(payload.get("claim_id", "tomo_took_seeds")),
                 )
             elif message_type == "gossip":
-                diff = self.world.gossip(
+                result = self.world.gossip(
                     actor_id=str(payload.get("actor_id", "")),
                     target_id=str(payload.get("target_id", "")),
                     rumor_id=str(payload.get("rumor_id", "rumor_tomo_took_seeds")),
                 )
             elif message_type == "investigate":
-                diff = self.world.investigate(subject_id=str(payload.get("subject_id", "")))
+                result = self.world.investigate(subject_id=str(payload.get("subject_id", "")))
+            elif message_type == "investigate_location":
+                result = self.world.investigate_location(location_id=str(payload.get("location_id", "")))
             elif message_type == "player_share_evidence":
-                diff = self.world.player_share_evidence(
+                result = self.world.player_share_evidence(
                     target_id=str(payload.get("target_id", "")),
                     evidence_id=str(payload.get("evidence_id", "torn_seed_bag")),
                 )
             elif message_type == "wait_minutes":
-                diff = self.world.wait_minutes(int(payload.get("minutes", 30)))
+                result = self.world.wait_minutes(int(payload.get("minutes", 30)))
             elif message_type == "autonomous_step":
-                diff = self.world.run_autonomous_episode_step(
+                result = self.world.run_autonomous_episode_step(
+                    actor_id=str(payload.get("actor_id", "mira")),
+                )
+            elif message_type == "run_village_step":
+                result = self.world.run_autonomous_episode_step(
                     actor_id=str(payload.get("actor_id", "mira")),
                 )
             else:
-                diff = self.world.reject_client_message(
+                result = self.world.reject_client_message(
                     message_type=str(message_type or "unknown"),
                     reason="Unsupported client message type.",
                 )
-        await self.broadcast({"type": "world_diff", "data": diff})
-        return diff
+        if "type" in result and result["type"] in {"dialogue_opened", "dialogue_result", "interaction_denied"}:
+            await self.broadcast(result)
+            if "world_diff" in result:
+                await self.broadcast({"type": "world_diff", "data": result["world_diff"]})
+        else:
+            await self.broadcast({"type": "world_diff", "data": result})
+        return result
 
     async def broadcast(self, message: dict[str, Any]) -> None:
         stale_clients: list[WebSocket] = []

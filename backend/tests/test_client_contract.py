@@ -16,6 +16,8 @@ class GodotClientContractTests(unittest.TestCase):
         for location in snapshot["locations"].values():
             self.assertIn("name", location)
             self.assertIn("position", location)
+            self.assertIn("visual_anchor", location)
+            self.assertIn("interaction_radius", location)
             self.assertIsInstance(location["position"]["x"], int)
             self.assertIsInstance(location["position"]["y"], int)
             self.assertIsInstance(location["current_occupants"], list)
@@ -34,7 +36,16 @@ class GodotClientContractTests(unittest.TestCase):
         world = WorldSimulation()
         diff = world.move_player("tavern")
 
-        for key in ["locations", "player", "npcs", "latest_events", "time", "event_log_cursor"]:
+        for key in [
+            "locations",
+            "player",
+            "npcs",
+            "latest_events",
+            "time",
+            "event_log_cursor",
+            "presentation",
+            "actor_movements",
+        ]:
             self.assertIn(key, diff)
         self.assertEqual(diff["reason"], "player_moved")
         self.assertEqual(diff["player"]["current_location"], "tavern")

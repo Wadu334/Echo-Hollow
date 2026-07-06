@@ -125,6 +125,8 @@ func _merge_world_diff(diff: Dictionary) -> void:
 		"last_director_trace",
 		"director_state",
 		"last_relationship_change",
+		"actor_movements",
+		"presentation",
 	]:
 		if diff.has(key):
 			world_data[key] = diff[key]

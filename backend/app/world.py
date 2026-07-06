@@ -36,6 +36,8 @@ class Location:
             "location_id": self.location_id,
             "name": self.name,
             "position": {"x": self.position[0], "y": self.position[1]},
+            "visual_anchor": {"x": self.position[0], "y": self.position[1]},
+            "interaction_radius": 96,
             "capacity": self.capacity,
             "tags": self.tags,
             "connected_locations": self.connected_locations,
@@ -74,11 +76,13 @@ class NPCState:
 class PlayerState:
     player_id: str = "player"
     current_location: str = "square"
+    notes: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "player_id": self.player_id,
             "current_location": self.current_location,
+            "notes": self.notes,
         }
 
 
@@ -252,6 +256,7 @@ class WorldSimulation:
         self._memory_counter = 0
         self._action_counter = 0
         self._event_log: list[EventLogEntry] = []
+        self._pending_actor_movements: list[dict[str, Any]] = []
         self.last_validator_result: dict[str, Any] | None = None
         self.last_agent_trace: dict[str, Any] | None = None
         self.last_director_trace: dict[str, Any] | None = None
@@ -515,6 +520,93 @@ class WorldSimulation:
         )
         return self._diff(reason="player_moved", changed_actor_ids=["player"], latest_events_count=1)
 
+    def player_entered_location(self, location_id: str) -> dict[str, Any]:
+        return self.move_player(location_id)
+
+    def player_interact_npc(self, npc_id: str, interaction: str = "talk") -> dict[str, Any]:
+        validation = self._validate_player_interaction(npc_id=npc_id, interaction=interaction)
+        if not validation["accepted"]:
+            return {
+                "type": "interaction_denied",
+                "reason": validation["rejection_code"],
+                "display_text": validation["display_text"],
+            }
+
+        self._append_event(
+            event_type="player_interacted_npc",
+            actor_id=self.player.player_id,
+            target_id=npc_id,
+            payload={"interaction": interaction},
+        )
+        return self._dialogue_payload(npc_id)
+
+    def dialogue_choice(self, npc_id: str, choice_id: str) -> dict[str, Any]:
+        validation = self._validate_player_interaction(npc_id=npc_id, interaction="talk")
+        if not validation["accepted"]:
+            return {
+                "type": "interaction_denied",
+                "reason": validation["rejection_code"],
+                "display_text": validation["display_text"],
+            }
+
+        event_id = self._append_event(
+            event_type="dialogue_choice_selected",
+            actor_id=self.player.player_id,
+            target_id=npc_id,
+            payload={"choice_id": choice_id},
+        )
+        toast = "They nod warmly."
+        changed_actor_ids = [self.player.player_id, npc_id]
+
+        if npc_id == "mira" and choice_id == "offer_help":
+            memory = self._write_memory(
+                owner_id="mira",
+                memory_type="episodic",
+                topic="missing_seeds",
+                summary="Player offered to help Mira search for the seed pouch.",
+                source_event_log_id=event_id,
+                truth_state="verified",
+                target_id="player",
+                importance=0.45,
+                emotional_valence=0.35,
+            )
+            self.director.on_memory_written(self, memory)
+            toast = "Mira remembers your offer to help."
+        elif npc_id == "tomo" and choice_id == "ask_what_he_saw":
+            self._add_player_note(
+                note_id="warehouse_door_open",
+                title="Warehouse Door",
+                text="Tomo saw the warehouse door open from the Farm.",
+                source_event_log_id=event_id,
+            )
+            toast = "Tomo shared what he saw near the Farm."
+        elif npc_id == "ivo" and choice_id == "ask_about_cat":
+            self._add_player_note(
+                note_id="cat_near_warehouse",
+                title="Cat Near Warehouse",
+                text="Ivo remembers a cat near the Warehouse.",
+                source_event_log_id=event_id,
+            )
+            toast = "Ivo remembers a cat near the Warehouse."
+
+        diff = self._diff(
+            reason="dialogue_choice",
+            changed_actor_ids=changed_actor_ids,
+            latest_events_count=8,
+            toasts=[toast],
+        )
+        return {
+            "type": "dialogue_result",
+            "npc_id": npc_id,
+            "choice_id": choice_id,
+            "toast": toast,
+            "display_text": toast,
+            "world_diff": diff,
+        }
+
+    def investigate_location(self, location_id: str) -> dict[str, Any]:
+        return self.investigate(location_id)
+
     def observe(self) -> dict[str, Any]:
         event_id = self._append_event(
             event_type="player_observed",
@@ -770,6 +862,7 @@ class WorldSimulation:
             "last_director_trace": self.last_director_trace,
             "director_state": self.director.to_dict(),
             "last_relationship_change": self.last_relationship_change,
+            "presentation": self._presentation(),
             "latest_events": self.events(limit=8),
         }
 
@@ -903,6 +996,15 @@ class WorldSimulation:
         npc.current_action = "move"
         npc.current_goal = f"move_to_{location_id}"
         self._npc_schedule_locks[actor_id] = self.world_minute + 30
+        self._pending_actor_movements.append(
+            {
+                "actor_id": actor_id,
+                "from_location": previous,
+                "to_location": location_id,
+                "duration_seconds": 4.0,
+                "display_text": f"{npc.name} is heading to the {self.locations[location_id].name}.",
+            }
+        )
         self._append_event(
             event_type="npc_moved",
             actor_id=actor_id,
@@ -1373,6 +1475,94 @@ class WorldSimulation:
                 fact["verified"] = True
                 fact["public"] = True
 
+    def _validate_player_interaction(self, npc_id: str, interaction: str) -> dict[str, Any]:
+        if npc_id not in self.npcs:
+            return {
+                "accepted": False,
+                "rejection_code": "npc_not_found",
+                "display_text": "No one is close enough to talk right now.",
+            }
+        if interaction != "talk":
+            return {
+                "accepted": False,
+                "rejection_code": "unsupported_interaction",
+                "display_text": "That interaction is not available yet.",
+            }
+        if self.player.current_location != self.npcs[npc_id].current_location:
+            return {
+                "accepted": False,
+                "rejection_code": "not_nearby",
+                "display_text": f"{self.npcs[npc_id].name} is not close enough right now.",
+            }
+        if "uninteractable" in self.npcs[npc_id].status_flags:
+            return {
+                "accepted": False,
+                "rejection_code": "not_interactable",
+                "display_text": f"{self.npcs[npc_id].name} is busy right now.",
+            }
+        return {"accepted": True, "rejection_code": None, "display_text": ""}
+
+    def _dialogue_payload(self, npc_id: str) -> dict[str, Any]:
+        dialogues = {
+            "mira": {
+                "line": "Thanks for helping me look for the seed pouch.",
+                "choices": [
+                    ("ask_about_seeds", "Ask About Seeds"),
+                    ("share_clue", "Share a Clue"),
+                    ("offer_help", "Offer Help"),
+                    ("bye", "Say Goodbye"),
+                ],
+            },
+            "tomo": {
+                "line": "I was by the Farm this morning. I remember the warehouse door being open.",
+                "choices": [
+                    ("ask_what_he_saw", "Ask What He Saw"),
+                    ("thank_him", "Thank Him"),
+                    ("bye", "Say Goodbye"),
+                ],
+            },
+            "ivo": {
+                "line": "I think I saw a cat near the warehouse last night.",
+                "choices": [
+                    ("ask_about_cat", "Ask About the Cat"),
+                    ("share_note", "Share a Note"),
+                    ("bye", "Say Goodbye"),
+                ],
+            },
+        }
+        dialogue = dialogues[npc_id]
+        return {
+            "type": "dialogue_opened",
+            "npc_id": npc_id,
+            "speaker": self.npcs[npc_id].name,
+            "line": dialogue["line"],
+            "choices": [
+                {"choice_id": choice_id, "text": text}
+                for choice_id, text in dialogue["choices"]
+            ],
+        }
+
+    def _add_player_note(
+        self,
+        note_id: str,
+        title: str,
+        text: str,
+        source_event_log_id: str,
+    ) -> None:
+        if not any(note["note_id"] == note_id for note in self.player.notes):
+            self.player.notes.append({"note_id": note_id, "title": title, "text": text})
+        self._append_event(
+            event_type="player_note_added",
+            actor_id=self.player.player_id,
+            target_id=None,
+            payload={
+                "note_id": note_id,
+                "title": title,
+                "text": text,
+                "source_event_log_id": source_event_log_id,
+            },
+        )
+
     def _player_has_evidence(self, evidence_id: str) -> bool:
         normalized = evidence_id.replace("fact_", "")
         if normalized not in {"torn_seed_bag", "seed_bag"}:
@@ -1415,8 +1605,11 @@ class WorldSimulation:
         reason: str,
         changed_actor_ids: list[str],
         latest_events_count: int,
+        toasts: list[str] | None = None,
     ) -> dict[str, Any]:
         snapshot = self.snapshot()
+        actor_movements = list(self._pending_actor_movements)
+        self._pending_actor_movements.clear()
         return {
             "world_id": self.world_id,
             "reason": reason,
@@ -1439,7 +1632,42 @@ class WorldSimulation:
             "last_director_trace": snapshot["last_director_trace"],
             "director_state": snapshot["director_state"],
             "last_relationship_change": snapshot["last_relationship_change"],
+            "actor_movements": actor_movements,
+            "presentation": self._presentation(toasts=toasts),
             "latest_events": self.events(limit=latest_events_count),
+        }
+
+    def _presentation(self, toasts: list[str] | None = None) -> dict[str, Any]:
+        phase = self.world_events["evt_missing_seeds"]["phase"]
+        phase_text = {
+            "public_problem": "A Little Problem",
+            "conflicting_claims": "Gathering Clues",
+            "suspicion_spread": "Checking In",
+            "confrontation_pending": "Someone Wants to Ask",
+            "confrontation_happened": "A Helpful Talk",
+            "evidence_found": "A Clue Found",
+            "resolution_pending": "Ready to Clear Things Up",
+            "resolved_reconciled": "Seeds Found Together",
+            "resolved_false_accusation": "A Misunderstanding",
+            "resolved_player_manipulated": "Trust Needs Repair",
+        }.get(phase, "Village Day")
+        flow_text = {
+            "public_problem": "The village is looking for a missing seed pouch.",
+            "conflicting_claims": "Neighbors are comparing small clues and trying to be fair.",
+            "suspicion_spread": "Mira is checking in with the village before anyone jumps ahead.",
+            "confrontation_pending": "Someone wants to ask a careful question.",
+            "confrontation_happened": "A helpful talk has moved things forward.",
+            "evidence_found": "A useful clue is ready to share.",
+            "resolution_pending": "The village is ready to clear things up.",
+            "resolved_reconciled": "The village worked together and trust feels warmer.",
+            "resolved_false_accusation": "A misunderstanding left feelings bruised.",
+            "resolved_player_manipulated": "The village needs time to rebuild trust.",
+        }.get(phase, "The village day continues.")
+        return {
+            "event_title": "The Missing Seed Pouch",
+            "event_phase_text": phase_text,
+            "village_flow_text": flow_text,
+            "toasts": toasts or [],
         }
 
     def _rejection(self, code: str, payload: dict[str, Any]) -> dict[str, Any]:

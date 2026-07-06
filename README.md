@@ -43,6 +43,13 @@ The Director is not a God Agent. It does not change relationships, write NPC mem
 - `client/`: Godot 4.x client project.
 - `docs/`: planning and implementation specs.
 
+## Documentation Map
+
+- `docs/current-state.md`: current implementation snapshot and next recommended goal.
+- `docs/implementation-pack.md`: staged build map from research blueprint to implementation.
+- `docs/specs/10-village-director-v0.md`: Director orchestration contract.
+- `docs/specs/12-playable-world-backend-support.md`: playable backend WebSocket and payload contracts.
+
 ## Backend Setup
 
 Use Python 3.11+.
@@ -63,6 +70,57 @@ Useful endpoints:
 - `GET /api/world/demo_world_001/events`
 - `GET /api/world/demo_world_001/agent`
 - `WS /ws/world/demo_world_001`
+
+## Playable World Backend Support
+
+The backend is intentionally not a per-frame coordinate server. Godot owns WASD input, collision, smooth movement, camera feel, and visual coordinates. The backend stays authoritative for logical location, interactions, memory, relationships, Director scheduling, episode state, and event logs.
+
+Playable WebSocket commands:
+
+- `player_entered_location`: Godot notifies the backend that the player entered a logical area.
+- `player_interact_npc`: opens deterministic NPC dialogue when the player and NPC share a logical location.
+- `dialogue_choice`: applies deterministic choice effects and returns a toast plus optional `world_diff`.
+- `investigate_location`: logical investigation alias for playable clients.
+- `wait_minutes`: advances world time.
+- `run_village_step`: asks the VillageDirector/AgentRuntime path to run one autonomous step.
+
+Dialogue responses use this shape:
+
+```json
+{
+  "type": "dialogue_opened",
+  "npc_id": "mira",
+  "speaker": "Mira",
+  "line": "Thanks for helping me look for the seed pouch.",
+  "choices": [
+    { "choice_id": "offer_help", "text": "Offer Help" }
+  ]
+}
+```
+
+World diffs may include:
+
+```json
+{
+  "actor_movements": [
+    {
+      "actor_id": "mira",
+      "from_location": "workshop",
+      "to_location": "farm",
+      "duration_seconds": 4.0,
+      "display_text": "Mira is heading to the Farm."
+    }
+  ],
+  "presentation": {
+    "event_title": "The Missing Seed Pouch",
+    "event_phase_text": "Gathering Clues",
+    "village_flow_text": "Neighbors are comparing small clues and trying to be fair.",
+    "toasts": []
+  }
+}
+```
+
+Known limitation: the current Godot client still uses simple number-key movement. The backend now supports the logical messages needed by the next Stardew-like client pass. See `docs/current-state.md` for the current capability map.
 
 The dashboard includes Agent Tool buttons. For example, move the player to Workshop, then use `Tell Mira: Tomo rumor` to trigger:
 
