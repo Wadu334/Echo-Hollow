@@ -115,11 +115,14 @@ func _merge_world_diff(diff: Dictionary) -> void:
 		"time",
 		"event_log_cursor",
 		"world_events",
+		"episode_phase",
+		"action_queue",
 		"memories",
 		"relationships",
 		"rumors",
 		"last_validator_result",
 		"last_agent_trace",
+		"last_relationship_change",
 	]:
 		if diff.has(key):
 			world_data[key] = diff[key]
@@ -215,7 +218,20 @@ func _create_actor_node(actor_id: String, display_name: String) -> Node2D:
 
 
 func _render_events(events: Array) -> void:
-	var lines := ["[b]Recent Events[/b]"]
+	var phase: String = str(world_data.get("episode_phase", "-"))
+	if phase == "-" and world_data.has("world_events"):
+		var event_data: Dictionary = world_data["world_events"].get("evt_missing_seeds", {})
+		if typeof(event_data) == TYPE_DICTIONARY:
+			phase = str(event_data.get("phase", "-"))
+
+	var lines: Array[String] = [
+		"[b]Episode[/b]",
+		"Phase: %s" % phase,
+		"Latest action: %s" % _latest_action_summary(),
+		"Relationship: %s" % _latest_relationship_summary(),
+		"",
+		"[b]Recent Events[/b]",
+	]
 	for event in events:
 		if typeof(event) == TYPE_DICTIONARY:
 			lines.append("%s  %s" % [event.get("world_time", ""), event.get("type", "")])
@@ -225,6 +241,27 @@ func _render_events(events: Array) -> void:
 		lines.append("[b]Agent[/b]")
 		lines.append("%s: %s" % [trace.get("actor_id", "-"), trace.get("decision", "-")])
 	event_label.text = "\n".join(lines)
+
+
+func _latest_action_summary() -> String:
+	var actions = world_data.get("action_queue", [])
+	if typeof(actions) != TYPE_ARRAY or actions.is_empty():
+		return "-"
+	var latest_action = actions[actions.size() - 1]
+	if typeof(latest_action) != TYPE_DICTIONARY:
+		return "-"
+	return "%s %s" % [latest_action.get("status", "-"), latest_action.get("tool_name", "-")]
+
+
+func _latest_relationship_summary() -> String:
+	var change = world_data.get("last_relationship_change", null)
+	if typeof(change) != TYPE_DICTIONARY:
+		return "-"
+	return "%s->%s trust %s" % [
+		change.get("owner_id", "-"),
+		change.get("target_id", "-"),
+		change.get("trust", "-"),
+	]
 
 
 func _send_move(location_id: String) -> void:

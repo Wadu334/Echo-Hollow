@@ -19,6 +19,10 @@ class DashboardRouteTests(unittest.TestCase):
         self.assertIn("move_player", body)
         self.assertIn("Agent Tools", body)
         self.assertIn("share_claim", body)
+        self.assertIn("player_share_evidence", body)
+        self.assertIn("autonomous_step", body)
+        self.assertIn("Action Queue", body)
+        self.assertIn("Relationships", body)
         self.assertIn("Agent Trace", body)
         self.assertIn("world json", body)
 

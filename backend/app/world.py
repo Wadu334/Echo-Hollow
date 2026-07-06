@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .agent import AgentContext, DeterministicAgentLoop
+from .agent_runtime import AgentRuntimeV1
+from .episode import MissingSeedsEpisodeManager
 
 
 def format_world_time(day: int, minute_of_day: int) -> str:
@@ -52,6 +53,7 @@ class NPCState:
     mood: str
     schedule: list[ScheduleSlot]
     status_flags: list[str] = field(default_factory=list)
+    behavior_modifiers: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -63,6 +65,7 @@ class NPCState:
             "current_goal": self.current_goal,
             "mood": self.mood,
             "status_flags": self.status_flags,
+            "behavior_modifiers": self.behavior_modifiers,
         }
 
 
@@ -185,16 +188,47 @@ class EventLogEntry:
         }
 
 
+@dataclass
+class QueuedAction:
+    action_id: str
+    actor_id: str
+    tool_name: str
+    args: dict[str, Any]
+    status: str
+    priority: int
+    created_at: str
+    execute_after_minute: int
+    expires_at_minute: int
+    source_memory_ids: list[str]
+    reason: str
+    validator_result: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action_id": self.action_id,
+            "actor_id": self.actor_id,
+            "tool_name": self.tool_name,
+            "args": self.args,
+            "status": self.status,
+            "priority": self.priority,
+            "created_at": self.created_at,
+            "execute_after_minute": self.execute_after_minute,
+            "expires_at_minute": self.expires_at_minute,
+            "source_memory_ids": self.source_memory_ids,
+            "reason": self.reason,
+            "validator_result": self.validator_result,
+        }
+
+
+ACTION_EXECUTABLE_STATUSES = {"proposed", "queued", "fallback_planned"}
+
+
 def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     return max(lower, min(upper, value))
 
 
 class WorldSimulation:
-    """Deterministic MVP world simulation.
-
-    The simulation intentionally contains no LLM hooks yet. It proves the
-    server-authoritative clock, NPC schedule loop, event log, and client sync.
-    """
+    """Deterministic world simulation with a bounded autonomous episode loop."""
 
     def __init__(self, world_id: str = "demo_world_001") -> None:
         self.world_id = world_id
@@ -208,12 +242,17 @@ class WorldSimulation:
         self.memories: dict[str, MemoryRecord] = {}
         self.relationships = self._build_relationships()
         self.rumors = self._build_rumors()
-        self.agent_loop = DeterministicAgentLoop()
+        self._npc_schedule_locks: dict[str, int] = {}
+        self.action_queue: dict[str, QueuedAction] = {}
+        self.agent_runtime = AgentRuntimeV1()
+        self.episode_manager = MissingSeedsEpisodeManager()
         self._event_counter = 0
         self._memory_counter = 0
+        self._action_counter = 0
         self._event_log: list[EventLogEntry] = []
         self.last_validator_result: dict[str, Any] | None = None
         self.last_agent_trace: dict[str, Any] | None = None
+        self.last_relationship_change: dict[str, Any] | None = None
         self._append_event(
             event_type="world_started",
             actor_id=None,
@@ -223,6 +262,10 @@ class WorldSimulation:
                 "active_events": self.active_events,
             },
         )
+
+    @property
+    def world_minute(self) -> int:
+        return (self.day - 1) * 24 * 60 + self.minute_of_day
 
     def _build_locations(self) -> dict[str, Location]:
         return {
@@ -247,7 +290,7 @@ class WorldSimulation:
                 name="Farm",
                 position=(690, 160),
                 capacity=5,
-                tags=["work", "food", "tomo"],
+                tags=["work", "tomo"],
                 connected_locations=["square", "warehouse"],
             ),
             "workshop": Location(
@@ -329,6 +372,9 @@ class WorldSimulation:
                 "event_id": "evt_missing_seeds",
                 "state": "active",
                 "phase": "public_problem",
+                "phase_started_minute": self.world_minute,
+                "rumor_started_minute": None,
+                "confrontation_minute": None,
                 "facts": [
                     {
                         "fact_id": "fact_seed_bag_missing",
@@ -391,7 +437,9 @@ class WorldSimulation:
             )
 
         changed_actor_ids: list[str] = []
-        for npc in self.npcs.values():
+        for npc_id, npc in self.npcs.items():
+            if self._npc_schedule_locks.get(npc_id, 0) > self.world_minute:
+                continue
             slot = self._current_slot(npc.schedule)
             if (
                 npc.current_location != slot.location_id
@@ -421,11 +469,20 @@ class WorldSimulation:
                     },
                 )
 
+        changed_actor_ids.extend(self._execute_due_actions())
+        self.episode_manager.on_tick(self)
+
         return self._diff(
             reason="tick",
-            changed_actor_ids=changed_actor_ids,
-            latest_events_count=max(1, len(changed_actor_ids)),
+            changed_actor_ids=sorted(set(changed_actor_ids)),
+            latest_events_count=max(1, len(changed_actor_ids) + 8),
         )
+
+    def wait_minutes(self, minutes: int) -> dict[str, Any]:
+        bounded_minutes = max(1, min(minutes, 12 * 60))
+        for _ in range(bounded_minutes):
+            self.tick()
+        return self._diff(reason="wait_completed", changed_actor_ids=[], latest_events_count=16)
 
     def move_player(self, location_id: str) -> dict[str, Any]:
         if location_id not in self.locations:
@@ -539,11 +596,11 @@ class WorldSimulation:
         )
         changed_actor_ids = [target_id]
         changed_actor_ids.extend(self._agent_planner_after_memory(memory))
-        return self._diff(reason="memory_shared", changed_actor_ids=changed_actor_ids, latest_events_count=6)
+        return self._diff(reason="memory_shared", changed_actor_ids=changed_actor_ids, latest_events_count=8)
 
     def gossip(self, actor_id: str, target_id: str, rumor_id: str) -> dict[str, Any]:
         validation = self._validate_tool(
-            tool_name="gossip",
+            tool_name="npc_gossip",
             actor_id=actor_id,
             target_id=target_id,
             topic="missing_seeds",
@@ -552,31 +609,21 @@ class WorldSimulation:
         if not validation["accepted"]:
             return self._tool_rejection(validation)
 
-        rumor = self.rumors[rumor_id]
-        if target_id not in rumor.current_holder_ids:
-            rumor.current_holder_ids.append(target_id)
-        if target_id not in rumor.source_chain:
-            rumor.source_chain.append(actor_id)
-        rumor.spread_count += 1
-        rumor.distortion_level = _clamp(rumor.distortion_level + 0.03)
-        rumor.confidence = _clamp(rumor.confidence + 0.05)
-
-        event_id = self._append_event(
-            event_type="rumor_spread",
-            actor_id=actor_id,
-            target_id=target_id,
-            payload={"rumor": rumor.to_dict()},
-        )
-        self._write_memory(
-            owner_id=target_id,
-            memory_type="rumor",
-            topic=rumor.topic,
-            summary=rumor.content,
-            source_event_log_id=event_id,
-            truth_state="unverified",
-            target_id="tomo",
-            importance=0.62,
-            emotional_valence=-0.3,
+        self._execute_validated_tool(
+            QueuedAction(
+                action_id="direct_gossip",
+                actor_id=actor_id,
+                tool_name="npc_gossip",
+                args={"actor_id": actor_id, "target_id": target_id, "rumor_id": rumor_id},
+                status="validating",
+                priority=0,
+                created_at=self.current_time,
+                execute_after_minute=self.world_minute,
+                expires_at_minute=self.world_minute + 1,
+                source_memory_ids=[],
+                reason="Manual dashboard NPC gossip.",
+                validator_result=validation,
+            )
         )
         return self._diff(reason="rumor_spread", changed_actor_ids=[actor_id, target_id], latest_events_count=4)
 
@@ -590,33 +637,90 @@ class WorldSimulation:
         if not validation["accepted"]:
             return self._tool_rejection(validation)
 
-        event = self.world_events["evt_missing_seeds"]
-        for fact in event["facts"]:
-            if fact["fact_id"] == "fact_torn_seed_bag":
-                fact["verified"] = True
-                fact["public"] = True
-        event["phase"] = "evidence_found"
-
+        self._mark_torn_seed_evidence_public()
+        self.episode_manager.set_phase(self, "evidence_found")
         event_id = self._append_event(
             event_type="evidence_found",
             actor_id=self.player.player_id,
             target_id=subject_id,
             payload={
+                "evidence_id": "torn_seed_bag",
                 "fact_id": "fact_torn_seed_bag",
                 "content": "The seed bag was torn open near the warehouse.",
-                "event_phase": event["phase"],
+                "event_phase": self.world_events["evt_missing_seeds"]["phase"],
             },
         )
         self._write_memory(
             owner_id=self.player.player_id,
-            memory_type="episodic",
+            memory_type="evidence",
             topic="missing_seeds",
             summary="Player found a torn seed bag near the warehouse.",
             source_event_log_id=event_id,
             truth_state="verified",
             importance=0.9,
         )
-        return self._diff(reason="evidence_found", changed_actor_ids=["player"], latest_events_count=3)
+        return self._diff(reason="evidence_found", changed_actor_ids=["player"], latest_events_count=4)
+
+    def player_share_evidence(self, target_id: str, evidence_id: str = "torn_seed_bag") -> dict[str, Any]:
+        validation = self._validate_tool(
+            tool_name="player_share_evidence",
+            actor_id=self.player.player_id,
+            target_id=target_id,
+            evidence_id=evidence_id,
+            topic="missing_seeds",
+        )
+        if not validation["accepted"]:
+            return self._tool_rejection(validation)
+
+        self.episode_manager.set_phase(self, "resolution_pending")
+        event_id = self._append_event(
+            event_type="evidence_shared",
+            actor_id=self.player.player_id,
+            target_id=target_id,
+            payload={
+                "evidence_id": evidence_id,
+                "summary": "Player showed Mira the torn seed bag evidence.",
+            },
+        )
+        self._write_memory(
+            owner_id=target_id,
+            memory_type="evidence",
+            topic="missing_seeds",
+            summary="Player showed evidence that the seed bag was torn near the warehouse.",
+            source_event_log_id=event_id,
+            truth_state="verified",
+            target_id=None,
+            importance=0.95,
+            emotional_valence=0.15,
+        )
+        self.episode_manager.resolve_event(self, "reconciled")
+        return self._diff(reason="evidence_shared", changed_actor_ids=[target_id, "player"], latest_events_count=12)
+
+    def resolve_event(self, event_id: str, path: str) -> dict[str, Any]:
+        validation = self._validate_tool(
+            tool_name="resolve_event",
+            actor_id="player",
+            target_id=event_id,
+            topic="missing_seeds",
+            path=path,
+            internal_call=False,
+        )
+        return self._tool_rejection(validation)
+
+    def run_autonomous_episode_step(self, actor_id: str = "mira") -> dict[str, Any]:
+        if actor_id not in self.npcs:
+            return self._rejection("actor_not_found", {"actor_id": actor_id})
+
+        triggering_memory = self._latest_relevant_memory(actor_id)
+        decision = self.agent_runtime.run_step(self, actor_id, triggering_memory)
+        self.last_agent_trace = decision.to_dict()
+        self._append_event(
+            event_type="agent_runtime_step",
+            actor_id=actor_id,
+            target_id=decision.queued_action_id,
+            payload=self.last_agent_trace,
+        )
+        return self._diff(reason="autonomous_step", changed_actor_ids=[actor_id], latest_events_count=4)
 
     def reject_client_message(self, message_type: str, reason: str) -> dict[str, Any]:
         self._append_event(
@@ -629,12 +733,15 @@ class WorldSimulation:
 
     def snapshot(self) -> dict[str, Any]:
         occupants = self._location_occupants()
+        event = self.world_events["evt_missing_seeds"]
         return {
             "world_id": self.world_id,
             "day": self.day,
-            "time": format_world_time(self.day, self.minute_of_day),
+            "time": self.current_time,
             "minute_of_day": self.minute_of_day,
+            "world_minute": self.world_minute,
             "active_events": self.active_events,
+            "episode_phase": event["phase"],
             "world_events": self.world_events,
             "event_log_cursor": self._event_counter,
             "locations": {
@@ -652,65 +759,417 @@ class WorldSimulation:
                 rumor_id: rumor.to_dict()
                 for rumor_id, rumor in sorted(self.rumors.items())
             },
+            "action_queue": [action.to_dict() for action in self._sorted_actions()],
             "last_validator_result": self.last_validator_result,
             "last_agent_trace": self.last_agent_trace,
+            "last_relationship_change": self.last_relationship_change,
             "latest_events": self.events(limit=8),
         }
+
+    @property
+    def current_time(self) -> str:
+        return format_world_time(self.day, self.minute_of_day)
 
     def events(self, limit: int = 50) -> list[dict[str, Any]]:
         bounded_limit = max(1, min(limit, 200))
         return [entry.to_dict() for entry in self._event_log[-bounded_limit:]]
 
-    def _current_slot(self, schedule: list[ScheduleSlot]) -> ScheduleSlot:
-        current = schedule[0]
-        for slot in schedule:
-            if self.minute_of_day >= slot.start_minute:
-                current = slot
-            else:
-                break
-        return current
-
-    def _location_occupants(self) -> dict[str, list[str]]:
-        occupants: dict[str, list[str]] = {location_id: [] for location_id in self.locations}
-        occupants[self.player.current_location].append(self.player.player_id)
-        for npc in self.npcs.values():
-            occupants[npc.current_location].append(npc.npc_id)
-        return occupants
-
-    def _diff(
+    def enqueue_action(
         self,
-        reason: str,
-        changed_actor_ids: list[str],
-        latest_events_count: int,
-    ) -> dict[str, Any]:
-        snapshot = self.snapshot()
-        return {
-            "world_id": self.world_id,
-            "reason": reason,
-            "time": snapshot["time"],
-            "minute_of_day": snapshot["minute_of_day"],
-            "event_log_cursor": snapshot["event_log_cursor"],
-            "changed_actor_ids": changed_actor_ids,
-            "locations": snapshot["locations"],
-            "player": snapshot["player"],
-            "npcs": snapshot["npcs"],
-            "memories": snapshot["memories"],
-            "relationships": snapshot["relationships"],
-            "rumors": snapshot["rumors"],
-            "world_events": snapshot["world_events"],
-            "last_validator_result": snapshot["last_validator_result"],
-            "last_agent_trace": snapshot["last_agent_trace"],
-            "latest_events": self.events(limit=latest_events_count),
-        }
-
-    def _rejection(self, code: str, payload: dict[str, Any]) -> dict[str, Any]:
-        self._append_event(
-            event_type="client_action_rejected",
-            actor_id=self.player.player_id,
-            target_id=None,
-            payload={"code": code, **payload},
+        actor_id: str,
+        tool_name: str,
+        args: dict[str, Any],
+        priority: int,
+        execute_after_minute: int | None = None,
+        expires_at_minute: int | None = None,
+        source_memory_ids: list[str] | None = None,
+        reason: str = "",
+        status: str = "queued",
+    ) -> str:
+        self._action_counter += 1
+        action_id = f"act_{self._action_counter:06d}"
+        action = QueuedAction(
+            action_id=action_id,
+            actor_id=actor_id,
+            tool_name=tool_name,
+            args=args,
+            status=status,
+            priority=priority,
+            created_at=self.current_time,
+            execute_after_minute=execute_after_minute if execute_after_minute is not None else self.world_minute,
+            expires_at_minute=expires_at_minute if expires_at_minute is not None else self.world_minute + 60,
+            source_memory_ids=source_memory_ids or [],
+            reason=reason,
+            validator_result=None,
         )
-        return self._diff(reason=code, changed_actor_ids=[], latest_events_count=1)
+        self.action_queue[action_id] = action
+        self._append_event(
+            event_type="action_queued",
+            actor_id=actor_id,
+            target_id=action_id,
+            payload=action.to_dict(),
+        )
+        return action_id
+
+    def has_pending_action(self, actor_id: str, tool_name: str, args: dict[str, Any]) -> bool:
+        comparable_args = {key: value for key, value in args.items() if key != "actor_id"}
+        for action in self.action_queue.values():
+            if action.status not in ACTION_EXECUTABLE_STATUSES:
+                continue
+            if action.actor_id != actor_id or action.tool_name != tool_name:
+                continue
+            action_args = {key: value for key, value in action.args.items() if key != "actor_id"}
+            if action_args == comparable_args:
+                return True
+        return False
+
+    def _execute_due_actions(self) -> list[str]:
+        changed_actor_ids: list[str] = []
+        due_actions = [
+            action
+            for action in self._sorted_actions()
+            if action.status in ACTION_EXECUTABLE_STATUSES and action.execute_after_minute <= self.world_minute
+        ]
+        for action in due_actions:
+            if action.expires_at_minute < self.world_minute:
+                action.status = "expired"
+                self._append_event(
+                    event_type="action_expired",
+                    actor_id=action.actor_id,
+                    target_id=action.action_id,
+                    payload=action.to_dict(),
+                )
+                continue
+
+            action.status = "validating"
+            validation = self._validate_action(action)
+            action.validator_result = validation
+            self._append_event(
+                event_type="action_validated",
+                actor_id=action.actor_id,
+                target_id=action.action_id,
+                payload={"action_id": action.action_id, "validator_result": validation},
+            )
+            if not validation["accepted"]:
+                action.status = "rejected"
+                self._append_event(
+                    event_type="action_rejected",
+                    actor_id=action.actor_id,
+                    target_id=action.action_id,
+                    payload=action.to_dict(),
+                )
+                self._plan_fallback_for_rejection(action, validation)
+                continue
+
+            changed_actor_ids.extend(self._execute_validated_tool(action))
+            action.status = "executed"
+            self._append_event(
+                event_type="action_executed",
+                actor_id=action.actor_id,
+                target_id=action.action_id,
+                payload=action.to_dict(),
+            )
+            self.episode_manager.on_action_executed(self, action)
+        return changed_actor_ids
+
+    def _execute_validated_tool(self, action: QueuedAction) -> list[str]:
+        args = action.args
+        if action.tool_name == "npc_move_to":
+            return self._execute_npc_move_to(str(args["actor_id"]), str(args["location_id"]))
+        if action.tool_name == "npc_talk_to":
+            return self._execute_npc_talk_to(str(args["actor_id"]), str(args["target_id"]), str(args["topic"]))
+        if action.tool_name == "npc_share_memory":
+            return self._execute_npc_share_memory(str(args["actor_id"]), str(args["target_id"]), str(args["memory_id"]))
+        if action.tool_name == "npc_gossip":
+            return self._execute_npc_gossip(str(args["actor_id"]), str(args["target_id"]), str(args["rumor_id"]))
+        if action.tool_name == "npc_investigate":
+            return self._execute_npc_investigate(str(args["actor_id"]), str(args["subject_id"]))
+        if action.tool_name == "player_share_evidence":
+            self.player_share_evidence(str(args["target_id"]), str(args.get("evidence_id", "torn_seed_bag")))
+            return ["player", str(args["target_id"])]
+        return []
+
+    def _execute_npc_move_to(self, actor_id: str, location_id: str) -> list[str]:
+        npc = self.npcs[actor_id]
+        previous = npc.current_location
+        npc.current_location = location_id
+        npc.current_action = "move"
+        npc.current_goal = f"move_to_{location_id}"
+        self._npc_schedule_locks[actor_id] = self.world_minute + 30
+        self._append_event(
+            event_type="npc_moved",
+            actor_id=actor_id,
+            target_id=location_id,
+            payload={"from": previous, "to": location_id},
+        )
+        return [actor_id]
+
+    def _execute_npc_talk_to(self, actor_id: str, target_id: str, topic: str) -> list[str]:
+        line = self.agent_runtime.provider.generate_dialogue(
+            {"speaker_id": actor_id, "target_id": target_id, "topic": topic}
+        ).line
+        event_id = self._append_event(
+            event_type="npc_dialogue_started",
+            actor_id=actor_id,
+            target_id=target_id,
+            payload={"topic": topic, "line": line},
+        )
+        self._npc_schedule_locks[actor_id] = self.world_minute + 20
+        self._npc_schedule_locks[target_id] = self.world_minute + 20
+        self._write_memory(
+            owner_id=actor_id,
+            memory_type="episodic",
+            topic=topic,
+            summary=f"{self.npcs[actor_id].name} questioned {self.npcs[target_id].name} about {topic}.",
+            source_event_log_id=event_id,
+            truth_state="verified",
+            target_id=target_id,
+            importance=0.58,
+            emotional_valence=-0.12,
+        )
+        self._write_memory(
+            owner_id=target_id,
+            memory_type="episodic",
+            topic=topic,
+            summary=f"{self.npcs[actor_id].name} questioned {self.npcs[target_id].name} about {topic}.",
+            source_event_log_id=event_id,
+            truth_state="verified",
+            target_id=actor_id,
+            importance=0.62,
+            emotional_valence=-0.28,
+        )
+        if actor_id == "mira" and target_id == "tomo" and topic == "missing_seeds":
+            if "suspicious_of_tomo" not in self.npcs["mira"].status_flags:
+                self.npcs["mira"].status_flags.append("suspicious_of_tomo")
+            self.npcs["mira"].mood = "stern"
+            self.npcs["tomo"].mood = "hurt"
+            self._change_relationship("tomo", "mira", {"trust": -0.08, "affinity": -0.04}, event_id)
+            self._spread_rumor_state("mira", "tomo", "rumor_tomo_took_seeds")
+        return [actor_id, target_id]
+
+    def _execute_npc_share_memory(self, actor_id: str, target_id: str, memory_id: str) -> list[str]:
+        source_memory = self.memories[memory_id]
+        event_id = self._append_event(
+            event_type="npc_memory_shared",
+            actor_id=actor_id,
+            target_id=target_id,
+            payload={"memory_id": memory_id, "summary": source_memory.summary},
+        )
+        self._write_memory(
+            owner_id=target_id,
+            memory_type=source_memory.type,
+            topic=source_memory.topic,
+            summary=source_memory.summary,
+            source_event_log_id=event_id,
+            truth_state=source_memory.truth_state,
+            target_id=source_memory.target_id,
+            importance=source_memory.importance,
+            emotional_valence=source_memory.emotional_valence,
+        )
+        return [actor_id, target_id]
+
+    def _execute_npc_gossip(self, actor_id: str, target_id: str, rumor_id: str) -> list[str]:
+        event_id = self._append_event(
+            event_type="rumor_spread",
+            actor_id=actor_id,
+            target_id=target_id,
+            payload={"rumor": self._spread_rumor_state(actor_id, target_id, rumor_id).to_dict()},
+        )
+        rumor = self.rumors[rumor_id]
+        self._write_memory(
+            owner_id=target_id,
+            memory_type="rumor",
+            topic=rumor.topic,
+            summary=rumor.content,
+            source_event_log_id=event_id,
+            truth_state="unverified",
+            target_id="tomo",
+            importance=0.62,
+            emotional_valence=-0.3,
+        )
+        return [actor_id, target_id]
+
+    def _execute_npc_investigate(self, actor_id: str, subject_id: str) -> list[str]:
+        event_id = self._append_event(
+            event_type="npc_investigated",
+            actor_id=actor_id,
+            target_id=subject_id,
+            payload={"topic": "missing_seeds", "subject_id": subject_id},
+        )
+        summary = f"{self.npcs[actor_id].name} investigated {self.locations[subject_id].name}."
+        if subject_id == "warehouse":
+            self._mark_torn_seed_evidence_public()
+            summary = f"{self.npcs[actor_id].name} found torn seed bag evidence near the warehouse."
+        self._write_memory(
+            owner_id=actor_id,
+            memory_type="evidence" if subject_id == "warehouse" else "episodic",
+            topic="missing_seeds",
+            summary=summary,
+            source_event_log_id=event_id,
+            truth_state="verified",
+            importance=0.82,
+        )
+        return [actor_id]
+
+    def _validate_action(self, action: QueuedAction) -> dict[str, Any]:
+        return self._validate_tool(
+            tool_name=action.tool_name,
+            actor_id=str(action.args.get("actor_id", action.actor_id)),
+            target_id=action.args.get("target_id"),
+            topic=str(action.args.get("topic", "missing_seeds")),
+            location_id=action.args.get("location_id"),
+            rumor_id=action.args.get("rumor_id"),
+            memory_id=action.args.get("memory_id"),
+            evidence_id=action.args.get("evidence_id"),
+            subject_id=action.args.get("subject_id"),
+            path=action.args.get("path"),
+            internal_call=bool(action.args.get("internal_call", False)),
+        )
+
+    def _validate_tool(
+        self,
+        tool_name: str,
+        actor_id: str,
+        target_id: str | None = None,
+        topic: str = "missing_seeds",
+        location_id: str | None = None,
+        rumor_id: str | None = None,
+        memory_id: str | None = None,
+        evidence_id: str | None = None,
+        subject_id: str | None = None,
+        path: str | None = None,
+        internal_call: bool = False,
+    ) -> dict[str, Any]:
+        result = {
+            "tool_name": tool_name,
+            "actor_id": actor_id,
+            "target_id": target_id,
+            "topic": topic,
+            "accepted": False,
+            "rejection_code": None,
+            "debug_reason": "",
+        }
+        actor_ids = self._actor_ids()
+        if tool_name == "resolve_event":
+            if internal_call and target_id in self.world_events and path:
+                result["accepted"] = True
+                result["debug_reason"] = "Scenario engine may resolve the event."
+            else:
+                result["rejection_code"] = "internal_only"
+                result["debug_reason"] = "resolve_event is callable only from the scenario engine."
+        elif actor_id not in actor_ids:
+            result["rejection_code"] = "actor_not_found"
+            result["debug_reason"] = f"Unknown actor {actor_id}."
+        elif tool_name in {"talk_to", "share_memory"}:
+            if target_id not in self.npcs:
+                result["rejection_code"] = "target_not_found"
+                result["debug_reason"] = f"Unknown NPC target {target_id}."
+            elif self._actor_location(actor_id) != self._actor_location(str(target_id)):
+                result["rejection_code"] = "target_unavailable"
+                result["debug_reason"] = "Actor and target must be in the same location."
+            else:
+                result["accepted"] = True
+                result["debug_reason"] = "Validator accepted player social tool."
+        elif tool_name == "investigate":
+            if target_id not in self.locations:
+                result["rejection_code"] = "location_not_found"
+                result["debug_reason"] = f"Unknown investigation location {target_id}."
+            elif self.player.current_location != target_id:
+                result["rejection_code"] = "not_reachable"
+                result["debug_reason"] = "Player must be at the location to investigate it."
+            else:
+                result["accepted"] = True
+                result["debug_reason"] = "Validator accepted player investigation."
+        elif tool_name == "npc_move_to":
+            if actor_id not in self.npcs:
+                result["rejection_code"] = "actor_not_found"
+                result["debug_reason"] = "Only NPCs may use npc_move_to."
+            elif location_id not in self.locations:
+                result["rejection_code"] = "location_not_found"
+                result["debug_reason"] = f"Unknown location {location_id}."
+            else:
+                result["accepted"] = True
+                result["debug_reason"] = "Validator accepted NPC movement."
+        elif tool_name == "npc_talk_to":
+            if actor_id not in self.npcs:
+                result["rejection_code"] = "actor_not_found"
+                result["debug_reason"] = "Only NPCs may initiate npc_talk_to."
+            elif target_id not in self.npcs:
+                result["rejection_code"] = "target_not_found"
+                result["debug_reason"] = f"Unknown NPC target {target_id}."
+            elif self._actor_location(actor_id) != self._actor_location(str(target_id)):
+                result["rejection_code"] = "target_unavailable"
+                result["debug_reason"] = "NPCs must share a location before talking."
+            else:
+                result["accepted"] = True
+                result["debug_reason"] = "Validator accepted NPC talk."
+        elif tool_name == "npc_share_memory":
+            if actor_id not in self.npcs or target_id not in self.npcs:
+                result["rejection_code"] = "target_not_found"
+                result["debug_reason"] = "Both actor and target must be NPCs."
+            elif self._actor_location(actor_id) != self._actor_location(str(target_id)):
+                result["rejection_code"] = "target_unavailable"
+                result["debug_reason"] = "NPCs must share a location before sharing memory."
+            elif memory_id not in self.memories:
+                result["rejection_code"] = "memory_not_found"
+                result["debug_reason"] = f"Unknown memory {memory_id}."
+            elif self.memories[str(memory_id)].owner_id != actor_id:
+                result["rejection_code"] = "memory_not_owned"
+                result["debug_reason"] = "Actor does not own the memory."
+            else:
+                result["accepted"] = True
+                result["debug_reason"] = "Validator accepted NPC memory share."
+        elif tool_name == "npc_gossip":
+            if actor_id not in self.npcs or target_id not in self.npcs:
+                result["rejection_code"] = "target_not_found"
+                result["debug_reason"] = "Both actor and target must be NPCs."
+            elif self._actor_location(actor_id) != self._actor_location(str(target_id)):
+                result["rejection_code"] = "target_unavailable"
+                result["debug_reason"] = "NPCs must share a location before gossip."
+            elif rumor_id is None or rumor_id not in self.rumors:
+                result["rejection_code"] = "rumor_not_found"
+                result["debug_reason"] = "Rumor must exist before it can spread."
+            elif actor_id not in self.rumors[str(rumor_id)].current_holder_ids:
+                result["rejection_code"] = "memory_not_owned"
+                result["debug_reason"] = "Actor does not hold this rumor."
+            elif target_id in self.rumors[str(rumor_id)].current_holder_ids:
+                result["rejection_code"] = "duplicate_information"
+                result["debug_reason"] = "Target already knows this rumor."
+            else:
+                result["accepted"] = True
+                result["debug_reason"] = "Validator accepted NPC gossip."
+        elif tool_name == "npc_investigate":
+            if actor_id not in self.npcs:
+                result["rejection_code"] = "actor_not_found"
+                result["debug_reason"] = "Only NPCs may use npc_investigate."
+            elif subject_id not in self.locations:
+                result["rejection_code"] = "location_not_found"
+                result["debug_reason"] = f"Unknown investigation subject {subject_id}."
+            elif self._actor_location(actor_id) != subject_id:
+                result["rejection_code"] = "target_unavailable"
+                result["debug_reason"] = "NPC must be at the location before investigating."
+            else:
+                result["accepted"] = True
+                result["debug_reason"] = "Validator accepted NPC investigation."
+        elif tool_name == "player_share_evidence":
+            if target_id not in self.npcs:
+                result["rejection_code"] = "target_not_found"
+                result["debug_reason"] = f"Unknown NPC target {target_id}."
+            elif self.player.current_location != self._actor_location(str(target_id)):
+                result["rejection_code"] = "target_unavailable"
+                result["debug_reason"] = "Player must be near the NPC to share evidence."
+            elif not self._player_has_evidence(str(evidence_id or "torn_seed_bag")):
+                result["rejection_code"] = "evidence_not_found"
+                result["debug_reason"] = "Player has not found this evidence yet."
+            else:
+                result["accepted"] = True
+                result["debug_reason"] = "Validator accepted evidence share."
+        else:
+            result["rejection_code"] = "tool_not_found"
+            result["debug_reason"] = f"Unknown tool {tool_name}."
+
+        self.last_validator_result = result
+        return result
 
     def _tool_rejection(self, validation: dict[str, Any]) -> dict[str, Any]:
         self.last_validator_result = validation
@@ -722,81 +1181,67 @@ class WorldSimulation:
         )
         return self._diff(reason=validation["rejection_code"], changed_actor_ids=[], latest_events_count=1)
 
-    def _validate_tool(
-        self,
-        tool_name: str,
-        actor_id: str,
-        target_id: str,
-        topic: str,
-        rumor_id: str | None = None,
-    ) -> dict[str, Any]:
-        result = {
-            "tool_name": tool_name,
-            "actor_id": actor_id,
-            "target_id": target_id,
-            "topic": topic,
-            "accepted": False,
-            "rejection_code": None,
-            "debug_reason": "",
-        }
-        if actor_id not in self._actor_ids():
-            result["rejection_code"] = "actor_not_found"
-            result["debug_reason"] = f"Unknown actor {actor_id}."
-        elif tool_name in {"talk_to", "share_memory", "gossip"} and target_id not in self.npcs:
-            result["rejection_code"] = "target_not_found"
-            result["debug_reason"] = f"Unknown NPC target {target_id}."
-        elif tool_name == "investigate" and target_id not in self.locations:
-            result["rejection_code"] = "location_not_found"
-            result["debug_reason"] = f"Unknown investigation location {target_id}."
-        elif tool_name in {"talk_to", "share_memory", "gossip"} and self._actor_location(actor_id) != self._actor_location(target_id):
-            result["rejection_code"] = "target_unavailable"
-            result["debug_reason"] = "Actor and target must be in the same location."
-        elif tool_name == "gossip" and (rumor_id is None or rumor_id not in self.rumors):
-            result["rejection_code"] = "rumor_not_found"
-            result["debug_reason"] = "Rumor must exist before it can spread."
-        elif tool_name == "gossip" and actor_id not in self.rumors[str(rumor_id)].current_holder_ids:
-            result["rejection_code"] = "memory_not_owned"
-            result["debug_reason"] = "Actor does not hold this rumor."
-        elif tool_name == "gossip" and target_id in self.rumors[str(rumor_id)].current_holder_ids:
-            result["rejection_code"] = "duplicate_information"
-            result["debug_reason"] = "Target already knows this rumor."
-        elif tool_name == "investigate" and self.player.current_location != target_id:
-            result["rejection_code"] = "not_reachable"
-            result["debug_reason"] = "Player must be at the location to investigate it."
-        else:
-            result["accepted"] = True
-            result["debug_reason"] = "Validator accepted tool proposal."
+    def _plan_fallback_for_rejection(self, action: QueuedAction, validation: dict[str, Any]) -> None:
+        if validation.get("rejection_code") != "target_unavailable":
+            return
 
-        self.last_validator_result = result
-        return result
+        target_location: str | None = None
+        target_id = action.args.get("target_id")
+        subject_id = action.args.get("subject_id")
+        if target_id in self.npcs:
+            target_location = self.npcs[str(target_id)].current_location
+        elif subject_id in self.locations:
+            target_location = str(subject_id)
+
+        if not target_location or action.actor_id not in self.npcs:
+            return
+
+        self.enqueue_action(
+            actor_id=action.actor_id,
+            tool_name="npc_move_to",
+            args={"actor_id": action.actor_id, "location_id": target_location},
+            priority=action.priority + 1,
+            execute_after_minute=self.world_minute + 1,
+            expires_at_minute=self.world_minute + 30,
+            source_memory_ids=action.source_memory_ids,
+            reason=f"Fallback for {action.action_id}: move toward unavailable target.",
+            status="fallback_planned",
+        )
+        self.enqueue_action(
+            actor_id=action.actor_id,
+            tool_name=action.tool_name,
+            args=action.args,
+            priority=max(0, action.priority - 1),
+            execute_after_minute=self.world_minute + 2,
+            expires_at_minute=self.world_minute + 90,
+            source_memory_ids=action.source_memory_ids,
+            reason=f"Retry after fallback movement for {action.action_id}.",
+        )
 
     def _agent_planner_after_memory(self, memory: MemoryRecord) -> list[str]:
-        changed_actor_ids: list[str] = []
-        context = self._agent_context(memory)
-        decision = self.agent_loop.decide_after_memory(context)
-        if decision.decision != "investigate_missing_seeds" or decision.tool_proposal is None:
-            self.last_agent_trace = decision.to_dict()
-            return changed_actor_ids
+        if memory.owner_id not in self.npcs:
+            return []
 
-        target_id = decision.tool_proposal.target_id
+        changed_actor_ids: list[str] = [memory.owner_id]
+        self.episode_manager.on_claim_memory(self, memory)
 
-        deltas = {"trust": -0.08, "affinity": -0.03}
-        relationship_event_id = self._change_relationship("mira", target_id, deltas, memory.memory_id)
-        npc = self.npcs["mira"]
-        npc.current_goal = "investigate_missing_seeds"
-        npc.current_action = "consider_rumor"
-        npc.mood = "suspicious"
-        flag = f"suspicious_of_{target_id}"
-        if flag not in npc.status_flags:
-            npc.status_flags.append(flag)
-        changed_actor_ids.append("mira")
-
-        if memory.target_id == "tomo":
+        if memory.owner_id == "mira" and memory.topic == "missing_seeds" and memory.target_id == "tomo":
+            cautious = self._mira_has_reflection_modifier()
+            deltas = {"trust": -0.015, "affinity": -0.005} if cautious else {"trust": -0.08, "affinity": -0.03}
+            relationship_event_id = self._change_relationship("mira", "tomo", deltas, memory.memory_id)
+            npc = self.npcs["mira"]
+            npc.current_goal = "investigate_missing_seeds"
+            npc.current_action = "consider_rumor"
+            npc.mood = "skeptical" if cautious else "suspicious"
+            flag = "checking_before_accusing" if cautious else "suspicious_of_tomo"
+            if flag not in npc.status_flags:
+                npc.status_flags.append(flag)
             rumor = self.rumors["rumor_tomo_took_seeds"]
             if "mira" not in rumor.current_holder_ids:
                 rumor.current_holder_ids.append("mira")
-            rumor.confidence = _clamp(max(rumor.confidence, 0.46))
-            rumor.spread_count += 1
+                rumor.source_chain.append("player")
+                rumor.spread_count += 1
+            rumor.confidence = _clamp(max(rumor.confidence, 0.38 if cautious else 0.46))
             self._write_memory(
                 owner_id="mira",
                 memory_type="rumor",
@@ -806,50 +1251,18 @@ class WorldSimulation:
                 truth_state="unverified",
                 target_id="tomo",
                 importance=0.7,
-                emotional_valence=-0.35,
+                emotional_valence=-0.2 if cautious else -0.35,
             )
 
+        decision = self.agent_runtime.run_step(self, memory.owner_id, memory)
         self.last_agent_trace = decision.to_dict()
-        self.last_agent_trace["validator_result"] = self._validate_tool(
-            tool_name=decision.tool_proposal.tool_name,
-            actor_id=decision.tool_proposal.actor_id,
-            target_id=decision.tool_proposal.target_id,
-            topic=decision.tool_proposal.topic,
-        )
         self._append_event(
             event_type="agent_action_planned",
-            actor_id="mira",
-            target_id=target_id,
+            actor_id=memory.owner_id,
+            target_id=decision.queued_action_id,
             payload=self.last_agent_trace,
         )
-        self.world_events["evt_missing_seeds"]["phase"] = "conflicting_claims"
         return changed_actor_ids
-
-    def _agent_context(self, memory: MemoryRecord) -> AgentContext:
-        relationship_state = None
-        if memory.target_id and memory.owner_id in self.npcs:
-            relationship = self.relationships.get(self._relationship_key(memory.owner_id, memory.target_id))
-            relationship_state = relationship.to_dict() if relationship else None
-
-        retrieved_memories = [
-            candidate.to_dict()
-            for candidate in self.memories.values()
-            if candidate.owner_id == memory.owner_id and candidate.topic == memory.topic
-        ][-5:]
-        facts = self.world_events["evt_missing_seeds"]["facts"] if memory.topic == "missing_seeds" else []
-        return AgentContext(
-            actor_id=memory.owner_id,
-            objective="Protect village order while avoiding unsupported accusations.",
-            triggering_memory=memory.to_dict(),
-            retrieved_memories=retrieved_memories,
-            relationship_state=relationship_state,
-            world_facts=facts,
-            allowed_tools=["talk_to", "share_memory", "gossip", "investigate"],
-            observations=[
-                f"{memory.owner_id} received {memory.type} memory {memory.memory_id}.",
-                f"Current event phase is {self.world_events['evt_missing_seeds']['phase']}.",
-            ],
-        )
 
     def _change_relationship(
         self,
@@ -869,6 +1282,7 @@ class WorldSimulation:
             },
         )
         relationship.apply(deltas, source_event_log_id=event_id)
+        self.last_relationship_change = relationship.to_dict() | {"deltas": deltas}
         return event_id
 
     def _write_memory(
@@ -890,7 +1304,7 @@ class WorldSimulation:
             owner_id=owner_id,
             topic=topic,
             summary=summary,
-            world_time=format_world_time(self.day, self.minute_of_day),
+            world_time=self.current_time,
             source_event_log_id=source_event_log_id,
             truth_state=truth_state,
             target_id=target_id,
@@ -905,6 +1319,29 @@ class WorldSimulation:
             payload=memory.to_dict(),
         )
         return memory
+
+    def _write_reflection_memory(
+        self,
+        owner_id: str,
+        summary: str,
+        source_event_log_id: str,
+        modifier: str,
+    ) -> MemoryRecord:
+        npc = self.npcs[owner_id]
+        for behavior_modifier in {modifier, "rumor_skepticism", "investigate_before_accuse"}:
+            if behavior_modifier not in npc.behavior_modifiers:
+                npc.behavior_modifiers.append(behavior_modifier)
+        return self._write_memory(
+            owner_id=owner_id,
+            memory_type="reflection",
+            topic="missing_seeds",
+            summary=summary,
+            source_event_log_id=source_event_log_id,
+            truth_state="verified",
+            target_id="tomo",
+            importance=0.88,
+            emotional_valence=0.1,
+        )
 
     def _memories_by_owner(self) -> dict[str, list[dict[str, Any]]]:
         grouped: dict[str, list[dict[str, Any]]] = {}
@@ -950,8 +1387,104 @@ class WorldSimulation:
             "ivo": "People talk when supplies go missing. I only repeat what I hear.",
         }.get(target_id, "No response.")
 
+    def _spread_rumor_state(self, actor_id: str, target_id: str, rumor_id: str) -> RumorState:
+        rumor = self.rumors[rumor_id]
+        if actor_id not in rumor.current_holder_ids:
+            rumor.current_holder_ids.append(actor_id)
+        if target_id not in rumor.current_holder_ids:
+            rumor.current_holder_ids.append(target_id)
+            rumor.spread_count += 1
+        if actor_id not in rumor.source_chain:
+            rumor.source_chain.append(actor_id)
+        rumor.distortion_level = _clamp(rumor.distortion_level + 0.03)
+        rumor.confidence = _clamp(rumor.confidence + 0.05)
+        return rumor
+
+    def _mark_torn_seed_evidence_public(self) -> None:
+        event = self.world_events["evt_missing_seeds"]
+        for fact in event["facts"]:
+            if fact["fact_id"] == "fact_torn_seed_bag":
+                fact["verified"] = True
+                fact["public"] = True
+
+    def _player_has_evidence(self, evidence_id: str) -> bool:
+        normalized = evidence_id.replace("fact_", "")
+        if normalized not in {"torn_seed_bag", "seed_bag"}:
+            return False
+        return any(
+            memory.owner_id == "player"
+            and memory.type == "evidence"
+            and "torn seed bag" in memory.summary.lower()
+            for memory in self.memories.values()
+        )
+
+    def _mira_has_reflection_modifier(self) -> bool:
+        modifiers = set(self.npcs["mira"].behavior_modifiers)
+        return bool({"rumor_skepticism", "investigate_before_accuse"} & modifiers)
+
+    def _latest_relevant_memory(self, actor_id: str) -> MemoryRecord | None:
+        for memory in reversed(list(self.memories.values())):
+            if memory.owner_id == actor_id and memory.topic == "missing_seeds":
+                return memory
+        return None
+
+    def _current_slot(self, schedule: list[ScheduleSlot]) -> ScheduleSlot:
+        current = schedule[0]
+        for slot in schedule:
+            if self.minute_of_day >= slot.start_minute:
+                current = slot
+            else:
+                break
+        return current
+
+    def _location_occupants(self) -> dict[str, list[str]]:
+        occupants: dict[str, list[str]] = {location_id: [] for location_id in self.locations}
+        occupants[self.player.current_location].append(self.player.player_id)
+        for npc in self.npcs.values():
+            occupants[npc.current_location].append(npc.npc_id)
+        return occupants
+
+    def _diff(
+        self,
+        reason: str,
+        changed_actor_ids: list[str],
+        latest_events_count: int,
+    ) -> dict[str, Any]:
+        snapshot = self.snapshot()
+        return {
+            "world_id": self.world_id,
+            "reason": reason,
+            "time": snapshot["time"],
+            "minute_of_day": snapshot["minute_of_day"],
+            "world_minute": snapshot["world_minute"],
+            "episode_phase": snapshot["episode_phase"],
+            "event_log_cursor": snapshot["event_log_cursor"],
+            "changed_actor_ids": changed_actor_ids,
+            "locations": snapshot["locations"],
+            "player": snapshot["player"],
+            "npcs": snapshot["npcs"],
+            "memories": snapshot["memories"],
+            "relationships": snapshot["relationships"],
+            "rumors": snapshot["rumors"],
+            "world_events": snapshot["world_events"],
+            "action_queue": snapshot["action_queue"],
+            "last_validator_result": snapshot["last_validator_result"],
+            "last_agent_trace": snapshot["last_agent_trace"],
+            "last_relationship_change": snapshot["last_relationship_change"],
+            "latest_events": self.events(limit=latest_events_count),
+        }
+
+    def _rejection(self, code: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self._append_event(
+            event_type="client_action_rejected",
+            actor_id=self.player.player_id,
+            target_id=None,
+            payload={"code": code, **payload},
+        )
+        return self._diff(reason=code, changed_actor_ids=[], latest_events_count=1)
+
     def _actor_ids(self) -> set[str]:
-        return {self.player.player_id, *self.npcs.keys()}
+        return {self.player.player_id, "scenario_engine", *self.npcs.keys()}
 
     def _actor_location(self, actor_id: str) -> str:
         if actor_id == self.player.player_id:
@@ -968,6 +1501,12 @@ class WorldSimulation:
     def _relationship_key(self, owner_id: str, target_id: str) -> str:
         return f"{owner_id}->{target_id}"
 
+    def _sorted_actions(self) -> list[QueuedAction]:
+        return sorted(
+            self.action_queue.values(),
+            key=lambda action: (-action.priority, action.execute_after_minute, action.action_id),
+        )
+
     def _append_event(
         self,
         event_type: str,
@@ -981,7 +1520,7 @@ class WorldSimulation:
             EventLogEntry(
                 event_log_id=event_id,
                 world_id=self.world_id,
-                world_time=format_world_time(self.day, self.minute_of_day),
+                world_time=self.current_time,
                 type=event_type,
                 actor_id=actor_id,
                 target_id=target_id,

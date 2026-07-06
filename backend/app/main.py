@@ -189,17 +189,33 @@ INDEX_HTML = """
       <section>
         <h2>Agent Tools</h2>
         <div class="buttons">
+          <button onclick="sendTool({ type: 'move_player', location_id: 'workshop' })">Move to Workshop</button>
+          <button onclick="sendTool({ type: 'share_claim', target_id: 'mira', claim_id: 'tomo_took_seeds' })">Tell Mira Tomo rumor</button>
+          <button onclick="sendTool({ type: 'wait_minutes', minutes: 30 })">Wait 30 minutes</button>
+          <button onclick="sendTool({ type: 'investigate', subject_id: 'warehouse' })">Investigate Warehouse</button>
+          <button onclick="sendTool({ type: 'player_share_evidence', target_id: 'mira', evidence_id: 'torn_seed_bag' })">Show evidence to Mira</button>
+          <button onclick="sendTool({ type: 'autonomous_step', actor_id: 'mira' })">Run autonomous episode step</button>
           <button onclick="sendTool({ type: 'observe' })">Observe</button>
           <button onclick="sendTool({ type: 'talk_to', target_id: 'mira', topic: 'missing_seeds' })">Talk to Mira</button>
-          <button onclick="sendTool({ type: 'share_claim', target_id: 'mira', claim_id: 'tomo_took_seeds' })">Tell Mira: Tomo rumor</button>
           <button onclick="sendTool({ type: 'share_claim', target_id: 'mira', claim_id: 'ivo_near_warehouse' })">Tell Mira: Ivo clue</button>
-          <button onclick="sendTool({ type: 'investigate', subject_id: 'warehouse' })">Investigate Warehouse</button>
           <button onclick="sendTool({ type: 'gossip', actor_id: 'mira', target_id: 'ivo', rumor_id: 'rumor_tomo_took_seeds' })">Mira gossips to Ivo</button>
         </div>
       </section>
       <section>
+        <h2>Episode</h2>
+        <pre id="episode"></pre>
+      </section>
+      <section>
+        <h2>Action Queue</h2>
+        <pre class="events" id="queue"></pre>
+      </section>
+      <section>
         <h2>Agent Trace</h2>
         <pre id="agent"></pre>
+      </section>
+      <section>
+        <h2>Relationships</h2>
+        <pre class="events" id="relationships"></pre>
       </section>
       <section>
         <h2>Memory</h2>
@@ -220,6 +236,9 @@ INDEX_HTML = """
     const buttonsEl = document.getElementById("buttons");
     const agentEl = document.getElementById("agent");
     const memoryEl = document.getElementById("memory");
+    const episodeEl = document.getElementById("episode");
+    const queueEl = document.getElementById("queue");
+    const relationshipsEl = document.getElementById("relationships");
     let socket;
     let latest = {};
 
@@ -282,18 +301,34 @@ INDEX_HTML = """
       worldEl.textContent = [
         `world: ${latest.world_id || worldId}`,
         `time: ${latest.time || "unknown"}`,
+        `phase: ${latest.episode_phase || "-"}`,
         `event log: ${latest.event_log_cursor ?? "-"}`,
-        `player: ${(latest.player || {}).current_location || "-"}`
+        `player: ${(latest.player || {}).current_location || "-"}`,
+        `queued actions: ${(latest.action_queue || []).filter(action => ["queued", "proposed", "fallback_planned"].includes(action.status)).length}`
       ].join("\\n");
+
+      const missingSeeds = ((latest.world_events || {}).evt_missing_seeds || {});
+      episodeEl.textContent = JSON.stringify({
+        phase: latest.episode_phase || missingSeeds.phase || null,
+        resolution_path: missingSeeds.resolution_path || null,
+        facts: missingSeeds.facts || []
+      }, null, 2);
+
+      queueEl.textContent = (latest.action_queue || []).map(action =>
+        `${action.action_id} ${action.status} ${action.tool_name} ${action.actor_id} p${action.priority}`
+      ).join("\\n") || "empty";
 
       agentEl.textContent = JSON.stringify({
         validator: latest.last_validator_result || null,
         agent: latest.last_agent_trace || null
       }, null, 2);
 
+      relationshipsEl.textContent = Object.values(latest.relationships || {}).map(rel =>
+        `${rel.owner_id} -> ${rel.target_id}  trust ${rel.trust}  affinity ${rel.affinity}`
+      ).join("\\n");
+
       memoryEl.textContent = JSON.stringify({
         memories: latest.memories || {},
-        relationships: latest.relationships || {},
         rumors: latest.rumors || {}
       }, null, 2);
 
@@ -357,6 +392,17 @@ class WorldHub:
                 )
             elif message_type == "investigate":
                 diff = self.world.investigate(subject_id=str(payload.get("subject_id", "")))
+            elif message_type == "player_share_evidence":
+                diff = self.world.player_share_evidence(
+                    target_id=str(payload.get("target_id", "")),
+                    evidence_id=str(payload.get("evidence_id", "torn_seed_bag")),
+                )
+            elif message_type == "wait_minutes":
+                diff = self.world.wait_minutes(int(payload.get("minutes", 30)))
+            elif message_type == "autonomous_step":
+                diff = self.world.run_autonomous_episode_step(
+                    actor_id=str(payload.get("actor_id", "mira")),
+                )
             else:
                 diff = self.world.reject_client_message(
                     message_type=str(message_type or "unknown"),
@@ -446,8 +492,11 @@ async def get_agent_state(world_id: str) -> dict[str, Any]:
         "memories": snapshot["memories"],
         "relationships": snapshot["relationships"],
         "rumors": snapshot["rumors"],
+        "episode_phase": snapshot["episode_phase"],
+        "action_queue": snapshot["action_queue"],
         "last_validator_result": snapshot["last_validator_result"],
         "last_agent_trace": snapshot["last_agent_trace"],
+        "last_relationship_change": snapshot["last_relationship_change"],
     }
 
 

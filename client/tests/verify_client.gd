@@ -1,7 +1,11 @@
 extends SceneTree
 
 
-func _initialize() -> void:
+func _init() -> void:
+	call_deferred("_run")
+
+
+func _run() -> void:
 	var scene := load("res://scenes/main.tscn")
 	if scene == null:
 		_fail("Could not load main scene.")

@@ -27,8 +27,9 @@ class AgentLoopTests(unittest.TestCase):
         self.assertTrue(any(memory["type"] == "episodic" for memory in diff["memories"]["mira"]))
         self.assertTrue(any(memory["type"] == "rumor" for memory in diff["memories"]["mira"]))
         self.assertLess(diff["relationships"]["mira->tomo"]["trust"], 0.5)
-        self.assertEqual(diff["last_agent_trace"]["decision"], "investigate_missing_seeds")
-        self.assertEqual(diff["last_agent_trace"]["tool_proposal"]["tool_name"], "talk_to")
+        self.assertEqual(diff["last_agent_trace"]["decision"], "action_queued")
+        self.assertEqual(diff["last_agent_trace"]["tool_proposal"]["tool_name"], "npc_talk_to")
+        self.assertTrue(any(action["tool_name"] == "npc_talk_to" for action in diff["action_queue"]))
         event_types = [event["type"] for event in world.events(limit=10)]
         self.assertIn("memory_written", event_types)
         self.assertIn("relationship_changed", event_types)
