@@ -43,29 +43,35 @@ class PlayableWorldBackendTests(unittest.TestCase):
         self.assertEqual(response["type"], "dialogue_opened")
         self.assertEqual(response["npc_id"], "mira")
         self.assertEqual(response["speaker"], "Mira")
-        self.assertIn("seed pouch", response["line"])
-        self.assertIn({"choice_id": "offer_help", "text": "Offer Help"}, response["choices"])
+        self.assertIn("workshop", response["line"])
+        self.assertIn({"choice_id": "greet", "text": "Greet"}, response["choices"])
+        self.assertIn({"choice_id": "ask_about_work", "text": "Ask About Work"}, response["choices"])
+        self.assertIn({"choice_id": "ask_about_village", "text": "Ask About Village"}, response["choices"])
+        self.assertIn({"choice_id": "goodbye", "text": "Goodbye"}, response["choices"])
 
-    def test_dialogue_choice_offer_help_writes_mira_memory(self) -> None:
+    def test_normal_dialogue_choice_returns_player_facing_feedback(self) -> None:
         world = WorldSimulation()
         world.move_player("workshop")
 
-        response = world.dialogue_choice("mira", "offer_help")
+        response = world.dialogue_choice("mira", "ask_about_work")
 
         self.assertEqual(response["type"], "dialogue_result")
-        self.assertEqual(response["toast"], "Mira remembers your offer to help.")
-        memories = response["world_diff"]["memories"]["mira"]
-        self.assertTrue(any("offered to help" in memory["summary"] for memory in memories))
+        self.assertEqual(response["toast"], "Mira says the workshop is quiet, which is exactly how she likes it.")
+        self.assertEqual(response["display_text"], response["toast"])
+        self.assertEqual(response["world_diff"]["reason"], "dialogue_choice")
 
-    def test_dialogue_choice_ask_about_cat_creates_helpful_note_and_toast(self) -> None:
-        world = WorldSimulation()
-        world.move_player("tavern")
+    def test_all_playable_npcs_expose_normal_conversation_choices(self) -> None:
+        locations = {"mira": "workshop", "tomo": "farm", "ivo": "square"}
 
-        response = world.dialogue_choice("ivo", "ask_about_cat")
-
-        self.assertEqual(response["toast"], "Ivo remembers a cat near the Warehouse.")
-        self.assertTrue(any(note["note_id"] == "cat_near_warehouse" for note in response["world_diff"]["player"]["notes"]))
-        self.assertTrue(any(event["type"] == "player_note_added" for event in world.events(limit=5)))
+        for npc_id, location_id in locations.items():
+            world = WorldSimulation()
+            world.move_player(location_id)
+            response = world.player_interact_npc(npc_id, "talk")
+            choice_ids = {choice["choice_id"] for choice in response["choices"]}
+            self.assertEqual(
+                choice_ids,
+                {"greet", "ask_about_work", "ask_about_village", "goodbye"},
+            )
 
     def test_actor_movement_diff_appears_when_npc_move_to_executes(self) -> None:
         world = WorldSimulation()
@@ -143,7 +149,7 @@ class PlayableWorldBackendTests(unittest.TestCase):
 
     def test_websocket_handler_broadcasts_dialogue_choice_world_diff(self) -> None:
         world = WorldSimulation()
-        world.move_player("tavern")
+        world.move_player("square")
         hub = CapturingHub(world)
 
         response = asyncio.run(
@@ -151,7 +157,7 @@ class PlayableWorldBackendTests(unittest.TestCase):
                 {
                     "type": "dialogue_choice",
                     "npc_id": "ivo",
-                    "choice_id": "ask_about_cat",
+                    "choice_id": "ask_about_village",
                 }
             )
         )

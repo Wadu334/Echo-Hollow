@@ -4,14 +4,17 @@ This is the current Godot 4.x playable client for Echo Hollow.
 
 ## Current Slice
 
-Playable World v0 is a local Godot scene with:
+Playable World v1 baseline is a local Godot scene with:
 
 - WASD player movement.
 - 4-direction player walking animation.
 - camera follow.
-- village square tile/prop art.
+- village tile/prop art with location labels and a central path network.
 - simple collision for major props.
 - Mira, Tomo, and Ivo as deterministic NPCs.
+- Ivo starts near the player as the first talkable NPC.
+- a dialogue panel for normal NPC conversation choices.
+- toast feedback after dialogue choices.
 - lightweight agent state bubbles above NPCs.
 
 The client can run without the backend. When the backend server is available, it also connects to:
@@ -23,8 +26,9 @@ ws://127.0.0.1:8000/ws/world/demo_world_001
 ## Controls
 
 - `WASD`: move player.
-- `E`: interact with nearest NPC.
+- `E`: talk to the nearest NPC.
 - `B`: toggle NPC state bubbles.
+- `F11`: toggle fullscreen.
 - `1`: jump to Square.
 - `2`: jump to Tavern.
 - `3`: jump to Farm.

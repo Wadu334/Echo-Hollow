@@ -20,6 +20,9 @@ func _run() -> void:
 	await physics_frame
 
 	_expect(main.location_nodes.size() == 5, "Expected 5 logical location markers.")
+	for location_id in ["square", "tavern", "farm", "workshop", "warehouse"]:
+		var marker = main.location_nodes.get(location_id)
+		_expect(marker != null and marker.has_node("%s_sign" % location_id), "Expected %s location sign." % location_id)
 	_expect(main.actor_nodes.has("player"), "Expected player node.")
 	_expect(main.actor_nodes.has("mira"), "Expected Mira node.")
 	_expect(main.actor_nodes.has("tomo"), "Expected Tomo node.")
@@ -37,6 +40,14 @@ func _run() -> void:
 		_expect(npc.get_node("Sprite").texture != null, "Expected %s sprite texture." % npc_id)
 		_expect(npc.has_node("StateBubble"), "Expected %s state bubble." % npc_id)
 		_expect(npc.get_node("StateBubble").visible, "Expected %s state bubble visible." % npc_id)
+
+	_expect(
+		player.position.distance_to(main.actor_nodes["ivo"].position) <= main.INTERACTION_DISTANCE,
+		"Expected Ivo to be the first talkable NPC near the spawn point."
+	)
+	main._update_approach_prompt()
+	_expect(main.approach_label.visible, "Expected a visible talk prompt near the first NPC.")
+	_expect("Ivo" in main.approach_label.text, "Expected the first talk prompt to name Ivo.")
 
 	_expect(main.prop_root.get_child_count() >= 6, "Expected collision props.")
 	_expect(main.tile_texture != null, "Expected tile texture.")
@@ -75,6 +86,45 @@ func _run() -> void:
 	var player_state: Dictionary = main.world_data.get("player", {})
 	_expect(player_state.get("current_location", "") == "square", "Expected server state merge, got %s." % str(player_state))
 
+	main._apply_server_message({
+		"type": "dialogue_opened",
+		"npc_id": "mira",
+		"speaker": "Mira",
+		"line": "Good to see you.",
+		"choices": [
+			{"choice_id": "greet", "text": "Greet"},
+			{"choice_id": "ask_about_work", "text": "Ask About Work"},
+			{"choice_id": "ask_about_village", "text": "Ask About Village"},
+			{"choice_id": "goodbye", "text": "Goodbye"},
+		],
+	})
+	await process_frame
+	_expect(main.dialogue_panel.visible, "Expected dialogue panel to open.")
+	_expect(main.active_dialogue_npc_id == "mira", "Expected active dialogue NPC.")
+	_expect(main.dialogue_choices_box.get_child_count() == 4, "Expected four normal dialogue choices.")
+
+	main._apply_server_message({
+		"type": "dialogue_result",
+		"npc_id": "mira",
+		"choice_id": "ask_about_work",
+		"display_text": "Mira says the workshop is quiet.",
+		"world_diff": _world_state(),
+	})
+	await process_frame
+	_expect(main.toast_label.visible, "Expected toast after dialogue choice.")
+	_expect("workshop" in main.dialogue_line_label.text, "Expected dialogue result text in panel.")
+
+	main._apply_server_message({
+		"type": "dialogue_result",
+		"npc_id": "mira",
+		"choice_id": "goodbye",
+		"display_text": "You step back from Mira's workbench.",
+		"world_diff": _world_state(),
+	})
+	await process_frame
+	_expect(not main.dialogue_panel.visible, "Expected goodbye to close the dialogue panel.")
+	_expect(main.active_dialogue_npc_id == "", "Expected active dialogue NPC to clear after goodbye.")
+
 	if not failures.is_empty():
 		for failure in failures:
 			push_error(failure)
@@ -103,7 +153,7 @@ func _world_state() -> Dictionary:
 		"npcs": {
 			"mira": _npc("mira", "Mira", "workshop", "steady"),
 			"tomo": _npc("tomo", "Tomo", "farm", "guarded"),
-			"ivo": _npc("ivo", "Ivo", "tavern", "warm"),
+			"ivo": _npc("ivo", "Ivo", "square", "warm"),
 		},
 		"latest_events": [
 			{

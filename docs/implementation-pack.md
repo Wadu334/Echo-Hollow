@@ -18,6 +18,7 @@ For the current implementation snapshot, start with `current-state.md`.
 - `specs/10-village-director-v0.md`: Director orchestration, pacing, fallback, and phase boundaries.
 - `specs/12-playable-world-backend-support.md`: backend contracts for a future Stardew-like Godot client.
 - `specs/13-playable-world-client-v0.md`: Godot WASD movement, imported pixel-cute assets, collision props, NPC routines, and agent state bubbles.
+- `specs/14-playable-world-v1-goal.md`: next playable loop goal, UX copy direction, and acceptance criteria.
 
 ## Recommended Build Order
 
@@ -37,13 +38,14 @@ Completed foundation:
 
 Recommended next build order:
 
-1. Add polished dialogue UI choices.
-2. Add visible logical location trigger areas and interaction affordances.
-3. Tween NPCs from backend `actor_movements`.
-4. Add HUD presentation and toast display.
+1. Add polished dialogue UI choices for normal NPC conversation.
+2. Add visible NPC approach prompts and conversation affordances.
+3. Add HUD and toast feedback with friendly objective copy.
+4. Add agent-driven follow-up actions after conversation.
 5. Add debug overlay for world/Director state.
-6. Add persistence after the playable loop feels good.
-7. Add LLM texture only after deterministic play remains stable.
+6. Add Missing Seeds investigation and evidence sharing after conversation feels good.
+7. Add persistence after the playable loop feels good.
+8. Add LLM texture only after deterministic play remains stable.
 
 ## Minimal Runtime Resources
 
@@ -86,7 +88,7 @@ Postgres + JSONB + pgvector remain good later targets once persistence and seman
 Build the playable Godot client layer:
 
 ```text
-WASD movement -> trigger logical locations -> interact with NPCs -> dialogue choices -> world_diff/presentation feedback
+WASD movement -> approach NPCs -> normal dialogue choices -> toast/HUD feedback
 ```
 
-The first WASD/collision/NPC-state slice now exists. Continue with dialogue choices, richer location triggers, and backend-driven NPC tweening. Do not integrate LLM until the playable loop is stable without it.
+The first WASD/collision/NPC-state slice now exists. Continue with normal NPC dialogue, approach prompts, and player-facing feedback. Add Missing Seeds progression and backend-driven agent actions only after the ordinary conversation loop feels stable. Do not integrate LLM until the deterministic play loop is stable without it.

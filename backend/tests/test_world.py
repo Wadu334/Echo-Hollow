@@ -13,6 +13,7 @@ class WorldSimulationTests(unittest.TestCase):
         self.assertEqual(snapshot["world_id"], "demo_world_001")
         self.assertEqual(snapshot["player"]["current_location"], "square")
         self.assertEqual(set(snapshot["npcs"].keys()), {"mira", "tomo", "ivo"})
+        self.assertEqual(snapshot["npcs"]["ivo"]["current_location"], "square")
         self.assertEqual(set(snapshot["locations"].keys()), {"square", "tavern", "farm", "workshop", "warehouse"})
         self.assertIn("evt_missing_seeds", snapshot["active_events"])
         self.assertGreaterEqual(snapshot["event_log_cursor"], 1)

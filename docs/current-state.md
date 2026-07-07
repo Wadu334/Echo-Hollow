@@ -84,15 +84,22 @@ Snapshots and diffs include:
 
 ## Client State
 
-The current Godot client now has a local Playable World v0 layer:
+The current Godot client now has a local Playable World v1 baseline:
 
 - `WASD` moves a `CharacterBody2D` player in the village square.
 - Player animation changes by facing direction: down, up, left, and right.
 - Pixel-cute assets are imported under `client/assets/playable_world_v0/`.
 - Major props have simple collision: well, noticeboard, crate, bench, fence, and lamp.
 - Mira, Tomo, and Ivo spawn as NPCs with deterministic patrol/idle routines.
+- Ivo starts near the player in the Square so the first interaction is immediately discoverable.
+- Major locations have in-world labels: Square, Tavern, Farm, Workshop, and Warehouse.
+- The tile map uses a central-square path network, small atlas variations, and clipped tile regions to reduce the debug-grid look.
 - NPCs show lightweight deterministic state bubbles for mood, memory, rumor, and relationship placeholders.
-- `B` toggles state bubbles; `E` interacts with the nearest NPC when close enough.
+- `E` opens a dialogue panel with normal conversation topics when the player is close enough.
+- Normal v1 dialogue choices are `greet`, `ask_about_work`, `ask_about_village`, and `goodbye`.
+- Dialogue choices show a player-facing response and toast.
+- `B` toggles state bubbles.
+- `F11` toggles fullscreen.
 - Number keys `1-5` still jump to logical locations for debugging and backend contract checks.
 - Headless verification passes.
 
@@ -107,9 +114,12 @@ The backend is still not a per-frame coordinate server. Godot owns movement, col
   "type": "dialogue_opened",
   "npc_id": "mira",
   "speaker": "Mira",
-  "line": "Thanks for helping me look for the seed pouch.",
+  "line": "Good to see you. I am checking the workshop list before the afternoon.",
   "choices": [
-    { "choice_id": "offer_help", "text": "Offer Help" }
+    { "choice_id": "greet", "text": "Greet" },
+    { "choice_id": "ask_about_work", "text": "Ask About Work" },
+    { "choice_id": "ask_about_village", "text": "Ask About Village" },
+    { "choice_id": "goodbye", "text": "Goodbye" }
   ]
 }
 ```
@@ -180,11 +190,19 @@ Expected current result:
 
 ## Recommended Next Goal
 
-Implement Playable World v1:
+Implement Playable World v1 as a normal NPC conversation prototype. See `docs/specs/14-playable-world-v1-goal.md`.
 
-- Add polished dialogue box and choice UI.
-- Add visible logical location trigger areas and interaction affordances.
-- Tween NPCs from backend `actor_movements`.
-- Replace placeholder bubbles with compact memory, rumor, relationship, and Director trace summaries.
-- Add HUD for `presentation` and toasts.
-- Add debug overlay for `world_diff`, Director trace, and action queue.
+First build:
+
+- Dialogue box and choice UI backed by `dialogue_choice`.
+- Normal conversation topics such as greeting, work, village, and goodbye.
+- NPC approach prompts and predictable conversation close/re-open behavior.
+- Toast and HUD feedback in player-facing language.
+
+Then build:
+
+- Missing Seeds investigation and evidence sharing.
+- Agent-driven follow-up actions after conversations.
+- NPC visual tweening from backend `actor_movements`.
+- Compact memory, rumor, relationship, and Director summaries in NPC bubbles.
+- Optional debug overlay for `world_diff`, Director trace, and action queue.

@@ -5,6 +5,8 @@ const SERVER_URL := "ws://127.0.0.1:8000/ws/world/demo_world_001"
 const VIEWPORT_SIZE := Vector2(960, 640)
 const WORLD_SIZE := Vector2(960, 672)
 const TILE_SIZE := 48
+const TILE_SOURCE_MARGIN := 2
+const TILE_SOURCE_SIZE := TILE_SIZE - TILE_SOURCE_MARGIN * 2
 const SPRITE_CELL_SIZE := 128
 const PLAYER_SPEED := 150.0
 const NPC_SPEED := 56.0
@@ -39,6 +41,14 @@ const ACTOR_NAMES := {
 	"ivo": "Ivo",
 }
 
+const LOCATION_NAMES := {
+	"square": "Square",
+	"tavern": "Tavern",
+	"farm": "Farm",
+	"workshop": "Workshop",
+	"warehouse": "Warehouse",
+}
+
 const LOCATION_CENTERS := {
 	"square": Vector2(480, 340),
 	"tavern": Vector2(176, 210),
@@ -55,6 +65,14 @@ const LOCATION_RECTS := {
 	"warehouse": Rect2(650, 70, 250, 210),
 }
 
+const LOCATION_LABEL_OFFSETS := {
+	"square": Vector2(-54, -98),
+	"tavern": Vector2(-52, -116),
+	"farm": Vector2(-34, -118),
+	"workshop": Vector2(-66, -110),
+	"warehouse": Vector2(-74, -118),
+}
+
 const TILE_ATLAS := {
 	"g": Vector2i(0, 0),
 	"d": Vector2i(1, 0),
@@ -67,18 +85,18 @@ const TILE_ATLAS := {
 }
 
 const MAP_ROWS := [
-	"ggggggggddddgggggggg",
-	"gggggggddddddggggggg",
-	"gggddddddssddddddggg",
+	"gggggggggggggggggggg",
+	"gggddggggggggggddggg",
+	"ggddddggggggggddddgg",
+	"ggddddddggggddddddgg",
+	"gggddddddggddddddggg",
+	"ggggddddssssddddgggg",
+	"gggggdddssssdddggggg",
+	"ggggddddssssddddgggg",
+	"gggdddddssssdddddggg",
 	"ggddddddssssddddddgg",
-	"gddddssssssssddddddg",
-	"ddddssssssssssdddddd",
-	"ddddssssssssssdddddd",
-	"gddddssssssssddddddg",
-	"ggddddddssssddddddgg",
-	"gggddddddssddddddggg",
-	"gggggddddddddddggggg",
-	"ggggggggddddgggggggg",
+	"ggddddgggddgggddddgg",
+	"gggddggggddggggddggg",
 	"gggggggggddggggggggg",
 	"gggggggggddggggggggg",
 ]
@@ -86,9 +104,9 @@ const MAP_ROWS := [
 const NPC_ROUTINES := {
 	"mira": [
 		Vector2(230, 500),
-		Vector2(315, 450),
-		Vector2(420, 395),
-		Vector2(350, 505),
+		Vector2(285, 462),
+		Vector2(315, 525),
+		Vector2(165, 520),
 	],
 	"tomo": [
 		Vector2(805, 430),
@@ -97,10 +115,10 @@ const NPC_ROUTINES := {
 		Vector2(790, 505),
 	],
 	"ivo": [
-		Vector2(176, 210),
-		Vector2(255, 285),
-		Vector2(405, 320),
-		Vector2(210, 345),
+		Vector2(540, 330),
+		Vector2(585, 300),
+		Vector2(535, 395),
+		Vector2(455, 310),
 	],
 }
 
@@ -108,7 +126,7 @@ const NPC_BUBBLES := {
 	"mira": {
 		"mood": "steady",
 		"memory": "wood",
-		"rumor": "seed",
+		"rumor": "village",
 		"relationship": "+trust",
 	},
 	"tomo": {
@@ -136,20 +154,30 @@ var npc_state: Dictionary = {}
 var bubbles_visible := true
 var enable_server_connection := true
 var local_player_location := "square"
-var last_interaction_text := "Press E near a villager. Press B to toggle agent bubbles."
+var last_interaction_text := "Walk up to a villager and press E to talk."
+var active_dialogue_npc_id := ""
+var toast_timer := 0.0
 
 var player_body: CharacterBody2D
 var tile_texture: Texture2D
 var prop_texture: Texture2D
 
 @onready var world_root := Node2D.new()
+@onready var tile_root := Node2D.new()
 @onready var prop_root := Node2D.new()
 @onready var actor_root := Node2D.new()
 @onready var location_root := Node2D.new()
 @onready var ui_layer := CanvasLayer.new()
 @onready var status_label := Label.new()
+@onready var objective_label := Label.new()
 @onready var hint_label := Label.new()
 @onready var event_label := RichTextLabel.new()
+@onready var approach_label := Label.new()
+@onready var toast_label := Label.new()
+@onready var dialogue_panel := PanelContainer.new()
+@onready var dialogue_title_label := Label.new()
+@onready var dialogue_line_label := Label.new()
+@onready var dialogue_choices_box := VBoxContainer.new()
 
 
 func _ready() -> void:
@@ -162,7 +190,8 @@ func _ready() -> void:
 	if enable_server_connection:
 		_attempt_server_connection()
 	else:
-		status_label.text = "Playable local mode. WebSocket disabled for verification."
+		status_label.text = "Echo Hollow | Offline Demo | Square"
+		objective_label.text = "Server sync is disabled for verification."
 
 
 func _physics_process(delta: float) -> void:
@@ -171,11 +200,23 @@ func _physics_process(delta: float) -> void:
 	_update_npc_routines(delta)
 	_update_player_location()
 	_update_status_label()
+	_update_approach_prompt()
+	_update_toast(delta)
 
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo:
+		if dialogue_panel.visible:
+			match event.keycode:
+				KEY_ESCAPE:
+					_close_dialogue()
+				KEY_1, KEY_2, KEY_3, KEY_4:
+					_choose_dialogue_by_number(event.keycode - KEY_1)
+			return
+
 		match event.keycode:
+			KEY_F11:
+				_toggle_fullscreen()
 			KEY_B:
 				bubbles_visible = not bubbles_visible
 				_update_bubble_visibility()
@@ -210,9 +251,11 @@ func _load_png_texture(res_path: String) -> Texture2D:
 func _attempt_server_connection() -> void:
 	var err := socket.connect_to_url(SERVER_URL)
 	if err != OK:
-		status_label.text = "Playable local mode. WebSocket connect failed: %s" % err
+		status_label.text = "Echo Hollow | Offline Demo | Square"
+		objective_label.text = "Server connection failed. Local movement is still available."
 	else:
-		status_label.text = "Playable local mode. Connecting to world server..."
+		status_label.text = "Echo Hollow | Connecting | Square"
+		objective_label.text = "Connecting to the village server..."
 
 
 func _poll_socket() -> void:
@@ -232,6 +275,7 @@ func _poll_socket() -> void:
 
 func _build_world_scene() -> void:
 	add_child(world_root)
+	world_root.add_child(tile_root)
 	world_root.add_child(location_root)
 	world_root.add_child(prop_root)
 	world_root.add_child(actor_root)
@@ -246,17 +290,47 @@ func _build_tile_ground() -> void:
 		var row: String = MAP_ROWS[y]
 		for x in row.length():
 			var key := row[x]
-			_add_tile(Vector2i(x, y), TILE_ATLAS.get(key, TILE_ATLAS["g"]))
+			var map_cell := Vector2i(x, y)
+			_add_tile(map_cell, _tile_atlas_for(key, map_cell))
+
+
+func _tile_atlas_for(key: String, map_cell: Vector2i) -> Vector2i:
+	var jitter: int = abs(map_cell.x * 17 + map_cell.y * 31) % 9
+	if key == "g" and jitter == 0:
+		return TILE_ATLAS["f"]
+	if key == "g" and jitter == 4:
+		return TILE_ATLAS["m"]
+	if key == "d" and jitter == 2:
+		return TILE_ATLAS["r"]
+	if key == "s" and jitter == 5:
+		return TILE_ATLAS["c"]
+	return TILE_ATLAS.get(key, TILE_ATLAS["g"])
 
 
 func _add_tile(map_cell: Vector2i, atlas_cell: Vector2i) -> void:
 	var tile := Sprite2D.new()
 	tile.texture = tile_texture
 	tile.region_enabled = true
-	tile.region_rect = Rect2(atlas_cell.x * TILE_SIZE, atlas_cell.y * TILE_SIZE, TILE_SIZE, TILE_SIZE)
+	var region_origin := Vector2(
+		atlas_cell.x * TILE_SIZE + TILE_SOURCE_MARGIN,
+		atlas_cell.y * TILE_SIZE + TILE_SOURCE_MARGIN
+	)
+	tile.region_rect = Rect2(region_origin, Vector2(TILE_SOURCE_SIZE, TILE_SOURCE_SIZE))
 	tile.position = Vector2(map_cell.x * TILE_SIZE + TILE_SIZE / 2, map_cell.y * TILE_SIZE + TILE_SIZE / 2)
+	tile.scale = Vector2(
+		float(TILE_SIZE) / float(TILE_SOURCE_SIZE),
+		float(TILE_SIZE) / float(TILE_SOURCE_SIZE)
+	)
 	tile.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
-	world_root.add_child(tile)
+	tile_root.add_child(tile)
+
+
+func _toggle_fullscreen() -> void:
+	var mode := DisplayServer.window_get_mode()
+	if mode == DisplayServer.WINDOW_MODE_FULLSCREEN or mode == DisplayServer.WINDOW_MODE_EXCLUSIVE_FULLSCREEN:
+		DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_WINDOWED)
+	else:
+		DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_FULLSCREEN)
 
 
 func _build_location_markers() -> void:
@@ -267,6 +341,31 @@ func _build_location_markers() -> void:
 		location_root.add_child(marker)
 		location_nodes[location_id] = marker
 		location_positions[location_id] = LOCATION_CENTERS[location_id]
+		_add_location_sign(location_id, marker)
+
+
+func _add_location_sign(location_id: String, marker: Node2D) -> void:
+	var sign := Node2D.new()
+	sign.name = "%s_sign" % location_id
+	sign.position = LOCATION_LABEL_OFFSETS.get(location_id, Vector2(-54, -96))
+	marker.add_child(sign)
+
+	var bg := ColorRect.new()
+	bg.color = Color(0.10, 0.12, 0.11, 0.62)
+	bg.size = Vector2(118, 26)
+	bg.position = Vector2.ZERO
+	sign.add_child(bg)
+
+	var label := Label.new()
+	label.text = LOCATION_NAMES.get(location_id, location_id.capitalize())
+	label.size = bg.size
+	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	label.add_theme_font_size_override("font_size", 12)
+	label.add_theme_color_override("font_color", Color(1.0, 0.96, 0.82, 1.0))
+	label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.8))
+	label.add_theme_constant_override("outline_size", 2)
+	sign.add_child(label)
 
 
 func _build_props() -> void:
@@ -308,20 +407,77 @@ func _build_static_ui() -> void:
 
 	status_label.position = Vector2(16, 12)
 	status_label.add_theme_font_size_override("font_size", 15)
-	status_label.text = "Playable local mode."
+	status_label.text = "Echo Hollow | Local | Square"
 	ui_layer.add_child(status_label)
+
+	objective_label.position = Vector2(16, 34)
+	objective_label.add_theme_font_size_override("font_size", 13)
+	objective_label.text = "Next: Walk up to a villager and press E to talk."
+	ui_layer.add_child(objective_label)
 
 	hint_label.position = Vector2(16, 606)
 	hint_label.add_theme_font_size_override("font_size", 14)
-	hint_label.text = "WASD move | E interact | B bubbles | 1-5 jump logical locations"
+	hint_label.text = "WASD move | E talk | B bubbles | F11 fullscreen | 1-5 debug jump"
 	ui_layer.add_child(hint_label)
 
-	event_label.position = Vector2(690, 18)
-	event_label.size = Vector2(252, 180)
+	event_label.position = Vector2(676, 18)
+	event_label.size = Vector2(270, 190)
 	event_label.bbcode_enabled = true
 	event_label.add_theme_font_size_override("normal_font_size", 13)
-	event_label.text = "[b]Village[/b]\nAgent bubbles are deterministic placeholders."
+	event_label.text = "[b]Village[/b]\nTalk with villagers and learn who they are.\nNext: Press E near a villager."
 	ui_layer.add_child(event_label)
+
+	approach_label.position = Vector2(300, 558)
+	approach_label.size = Vector2(360, 28)
+	approach_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	approach_label.add_theme_font_size_override("font_size", 15)
+	approach_label.add_theme_color_override("font_color", Color(1.0, 0.96, 0.82, 1.0))
+	approach_label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.9))
+	approach_label.add_theme_constant_override("outline_size", 4)
+	approach_label.visible = false
+	ui_layer.add_child(approach_label)
+
+	toast_label.position = Vector2(290, 92)
+	toast_label.size = Vector2(380, 42)
+	toast_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	toast_label.add_theme_font_size_override("font_size", 14)
+	toast_label.add_theme_color_override("font_color", Color(1.0, 0.98, 0.88, 1.0))
+	toast_label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.9))
+	toast_label.add_theme_constant_override("outline_size", 4)
+	toast_label.visible = false
+	ui_layer.add_child(toast_label)
+
+	_build_dialogue_ui()
+
+
+func _build_dialogue_ui() -> void:
+	dialogue_panel.position = Vector2(210, 414)
+	dialogue_panel.size = Vector2(540, 176)
+	dialogue_panel.visible = false
+	ui_layer.add_child(dialogue_panel)
+
+	var margin := MarginContainer.new()
+	margin.add_theme_constant_override("margin_left", 14)
+	margin.add_theme_constant_override("margin_top", 10)
+	margin.add_theme_constant_override("margin_right", 14)
+	margin.add_theme_constant_override("margin_bottom", 12)
+	dialogue_panel.add_child(margin)
+
+	var layout := VBoxContainer.new()
+	layout.add_theme_constant_override("separation", 7)
+	margin.add_child(layout)
+
+	dialogue_title_label.add_theme_font_size_override("font_size", 16)
+	dialogue_title_label.add_theme_color_override("font_color", Color(0.18, 0.13, 0.08, 1.0))
+	layout.add_child(dialogue_title_label)
+
+	dialogue_line_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	dialogue_line_label.add_theme_font_size_override("font_size", 13)
+	dialogue_line_label.add_theme_color_override("font_color", Color(0.20, 0.16, 0.12, 1.0))
+	layout.add_child(dialogue_line_label)
+
+	dialogue_choices_box.add_theme_constant_override("separation", 5)
+	layout.add_child(dialogue_choices_box)
 
 
 func _spawn_player() -> void:
@@ -425,6 +581,10 @@ func _create_state_bubble(actor_id: String) -> Node2D:
 
 func _update_player_movement(delta: float) -> void:
 	if player_body == null:
+		return
+	if dialogue_panel.visible:
+		player_body.velocity = Vector2.ZERO
+		_update_actor_animation("player", Vector2.ZERO, delta)
 		return
 
 	var input_vector := Vector2.ZERO
@@ -537,6 +697,28 @@ func _update_bubble_visibility() -> void:
 
 
 func _interact_with_nearest_npc() -> void:
+	var nearest_id := _nearest_talkable_npc_id()
+	if nearest_id == "":
+		last_interaction_text = "Move closer to a villager, then press E."
+		_show_toast(last_interaction_text)
+		return
+
+	last_interaction_text = "Opening conversation with %s..." % ACTOR_NAMES[nearest_id]
+	_send_interact_npc(nearest_id)
+
+
+func _update_status_label() -> void:
+	var connection_text := "Online" if connected else "Local"
+	status_label.text = "Echo Hollow | %s | %s" % [
+		connection_text,
+		_pretty_location(local_player_location),
+	]
+	objective_label.text = "Next: %s" % _current_player_prompt()
+
+
+func _nearest_talkable_npc_id() -> String:
+	if player_body == null:
+		return ""
 	var nearest_id := ""
 	var nearest_distance := INF
 	for npc_id in ["mira", "tomo", "ivo"]:
@@ -547,22 +729,35 @@ func _interact_with_nearest_npc() -> void:
 		if distance < nearest_distance:
 			nearest_distance = distance
 			nearest_id = npc_id
+	if nearest_distance <= INTERACTION_DISTANCE:
+		return nearest_id
+	return ""
 
-	if nearest_id == "" or nearest_distance > INTERACTION_DISTANCE:
-		last_interaction_text = "No villager is close enough."
+
+func _update_approach_prompt() -> void:
+	if dialogue_panel.visible:
+		approach_label.visible = false
 		return
+	var nearest_id := _nearest_talkable_npc_id()
+	if nearest_id == "":
+		approach_label.visible = false
+		return
+	approach_label.text = "Press E to talk to %s" % ACTOR_NAMES.get(nearest_id, nearest_id.capitalize())
+	approach_label.visible = true
 
-	last_interaction_text = "Talking with %s." % ACTOR_NAMES[nearest_id]
-	_send_interact_npc(nearest_id)
+
+func _update_toast(delta: float) -> void:
+	if toast_timer <= 0.0:
+		return
+	toast_timer -= delta
+	if toast_timer <= 0.0:
+		toast_label.visible = false
 
 
-func _update_status_label() -> void:
-	var connection_text := "online" if connected else "local"
-	status_label.text = "Echo Hollow Playable v0 | %s | location: %s | %s" % [
-		connection_text,
-		local_player_location,
-		last_interaction_text,
-	]
+func _show_toast(text: String) -> void:
+	toast_label.text = text
+	toast_label.visible = true
+	toast_timer = 3.0
 
 
 func _apply_server_message(message: Dictionary) -> void:
@@ -575,14 +770,76 @@ func _apply_server_message(message: Dictionary) -> void:
 	elif message.get("type") == "world_diff":
 		_merge_world_diff(payload)
 	elif message.get("type") == "dialogue_opened":
-		last_interaction_text = "%s: %s" % [message.get("speaker", "Villager"), message.get("line", "")]
+		last_interaction_text = "%s says: %s" % [message.get("speaker", "Villager"), message.get("line", "")]
+		_show_dialogue(message)
+	elif message.get("type") == "dialogue_result":
+		last_interaction_text = str(message.get("display_text", message.get("toast", "Choice noted.")))
+		var result_diff = message.get("world_diff", {})
+		if typeof(result_diff) == TYPE_DICTIONARY:
+			_merge_world_diff(result_diff)
+		_show_dialogue_result(message)
 	elif message.get("type") == "interaction_denied":
 		last_interaction_text = str(message.get("display_text", "Not close enough."))
+		_show_toast(last_interaction_text)
 	else:
 		return
 
 	_sync_bubbles_from_world()
 	_render_events(world_data.get("latest_events", []))
+
+
+func _show_dialogue(message: Dictionary) -> void:
+	active_dialogue_npc_id = str(message.get("npc_id", ""))
+	dialogue_title_label.text = str(message.get("speaker", "Villager"))
+	dialogue_line_label.text = str(message.get("line", "Hello."))
+	_rebuild_dialogue_choices(message.get("choices", []))
+	dialogue_panel.visible = true
+	approach_label.visible = false
+
+
+func _show_dialogue_result(message: Dictionary) -> void:
+	var text := str(message.get("display_text", message.get("toast", "Choice noted.")))
+	dialogue_line_label.text = text
+	_show_toast(text)
+	if str(message.get("choice_id", "")) == "goodbye":
+		_close_dialogue()
+
+
+func _rebuild_dialogue_choices(choices: Variant) -> void:
+	for child in dialogue_choices_box.get_children():
+		child.queue_free()
+	if typeof(choices) != TYPE_ARRAY:
+		return
+	for index in choices.size():
+		var choice = choices[index]
+		if typeof(choice) != TYPE_DICTIONARY:
+			continue
+		var choice_id := str(choice.get("choice_id", ""))
+		var text := str(choice.get("text", choice_id.capitalize()))
+		var button := Button.new()
+		button.text = "%d. %s" % [index + 1, text]
+		button.focus_mode = Control.FOCUS_NONE
+		button.custom_minimum_size = Vector2(0, 28)
+		button.pressed.connect(_on_dialogue_choice_pressed.bind(choice_id))
+		dialogue_choices_box.add_child(button)
+
+
+func _on_dialogue_choice_pressed(choice_id: String) -> void:
+	_send_dialogue_choice(choice_id)
+
+
+func _choose_dialogue_by_number(index: int) -> void:
+	if index < 0 or index >= dialogue_choices_box.get_child_count():
+		return
+	var button = dialogue_choices_box.get_child(index)
+	if button is Button:
+		(button as Button).emit_signal("pressed")
+
+
+func _close_dialogue() -> void:
+	dialogue_panel.visible = false
+	active_dialogue_npc_id = ""
+	last_interaction_text = "Walk up to a villager and press E to talk."
 
 
 func _merge_world_diff(diff: Dictionary) -> void:
@@ -634,30 +891,81 @@ func _sync_bubbles_from_world() -> void:
 
 
 func _render_events(events: Array) -> void:
-	var phase := str(world_data.get("episode_phase", "-"))
 	var presentation: Dictionary = world_data.get("presentation", {})
+	var title := "Village"
+	var phase_text := "Talk with villagers and learn who they are."
+	var toasts = presentation.get("toasts", [])
 	var lines: Array[String] = [
-		"[b]Village[/b]",
-		str(presentation.get("event_phase_text", "Playable local slice")),
-		"Phase: %s" % phase,
-		"Latest: %s" % _latest_action_summary(),
-		"",
-		"[b]Events[/b]",
+		"[b]%s[/b]" % title,
+		phase_text,
+		"Next: %s" % _current_player_prompt(),
 	]
+	if typeof(toasts) == TYPE_ARRAY and not toasts.is_empty():
+		lines.append("Update: %s" % str(toasts[toasts.size() - 1]))
+	lines.append("")
+	lines.append("[b]Recent[/b]")
 	for event in events.slice(maxi(0, events.size() - 4), events.size()):
 		if typeof(event) == TYPE_DICTIONARY:
-			lines.append("%s  %s" % [event.get("world_time", ""), event.get("type", "")])
+			lines.append("%s  %s" % [
+				event.get("world_time", ""),
+				_event_display_label(str(event.get("type", ""))),
+			])
 	event_label.text = "\n".join(lines)
 
 
-func _latest_action_summary() -> String:
-	var actions = world_data.get("action_queue", [])
-	if typeof(actions) != TYPE_ARRAY or actions.is_empty():
-		return "-"
-	var latest_action = actions[actions.size() - 1]
-	if typeof(latest_action) != TYPE_DICTIONARY:
-		return "-"
-	return "%s %s" % [latest_action.get("status", "-"), latest_action.get("tool_name", "-")]
+func _current_player_prompt() -> String:
+	if dialogue_panel.visible:
+		return "Choose a topic, or press Esc to close the conversation."
+	if not last_interaction_text.is_empty():
+		return last_interaction_text
+	var player = world_data.get("player", {})
+	if typeof(player) == TYPE_DICTIONARY:
+		var notes = player.get("notes", [])
+		if typeof(notes) == TYPE_ARRAY and not notes.is_empty():
+			return "You learned something new. Talk to another villager."
+	return "Walk up to a villager and press E to talk."
+
+
+func _event_display_label(event_type: String) -> String:
+	match event_type:
+		"world_started":
+			return "The village day begins."
+		"player_moved":
+			return "You changed location."
+		"player_interacted_npc":
+			return "Conversation started."
+		"dialogue_choice_selected":
+			return "You answered."
+		"player_note_added":
+			return "You learned something new."
+		"memory_written":
+			return "Someone remembered something."
+		"relationship_changed":
+			return "A relationship shifted."
+		"rumor_spread":
+			return "A rumor spread."
+		"npc_schedule_changed":
+			return "A villager changed plans."
+		"evidence_found":
+			return "Something interesting was found."
+		_:
+			return event_type.replace("_", " ").capitalize()
+
+
+func _pretty_location(location_id: String) -> String:
+	match location_id:
+		"square":
+			return "Square"
+		"tavern":
+			return "Tavern"
+		"farm":
+			return "Farm"
+		"workshop":
+			return "Workshop"
+		"warehouse":
+			return "Warehouse"
+		_:
+			return location_id.capitalize()
 
 
 func _send_location_entered(location_id: String) -> void:
@@ -671,9 +979,23 @@ func _send_location_entered(location_id: String) -> void:
 
 func _send_interact_npc(npc_id: String) -> void:
 	if socket.get_ready_state() != WebSocketPeer.STATE_OPEN:
+		_show_toast("Village server is not connected yet.")
 		return
 	socket.send_text(JSON.stringify({
 		"type": "player_interact_npc",
 		"npc_id": npc_id,
 		"interaction": "talk",
+	}))
+
+
+func _send_dialogue_choice(choice_id: String) -> void:
+	if active_dialogue_npc_id == "":
+		return
+	if socket.get_ready_state() != WebSocketPeer.STATE_OPEN:
+		_show_toast("Village server is not connected yet.")
+		return
+	socket.send_text(JSON.stringify({
+		"type": "dialogue_choice",
+		"npc_id": active_dialogue_npc_id,
+		"choice_id": choice_id,
 	}))

@@ -359,14 +359,14 @@ class WorldSimulation:
                 npc_id="ivo",
                 name="Ivo",
                 role="tavern keeper",
-                current_location="tavern",
-                current_action="serve",
-                current_goal="keep_business_running",
+                current_location="square",
+                current_action="chat",
+                current_goal="welcome_villagers",
                 mood="watchful",
                 status_flags=["rumor_hub"],
                 schedule=[
-                    ScheduleSlot(8 * 60, "serve", "tavern", "keep_business_running"),
-                    ScheduleSlot(11 * 60, "visit", "square", "hear_village_news"),
+                    ScheduleSlot(8 * 60, "chat", "square", "welcome_villagers"),
+                    ScheduleSlot(11 * 60, "serve", "tavern", "keep_business_running"),
                     ScheduleSlot(12 * 60, "serve", "tavern", "host_lunch"),
                     ScheduleSlot(16 * 60, "check", "warehouse", "protect_reputation"),
                     ScheduleSlot(17 * 60, "serve", "tavern", "keep_business_running"),
@@ -555,7 +555,7 @@ class WorldSimulation:
             target_id=npc_id,
             payload={"choice_id": choice_id},
         )
-        toast = "They nod warmly."
+        toast = self._dialogue_choice_response(npc_id, choice_id)
         changed_actor_ids = [self.player.player_id, npc_id]
 
         if npc_id == "mira" and choice_id == "offer_help":
@@ -1505,28 +1505,30 @@ class WorldSimulation:
     def _dialogue_payload(self, npc_id: str) -> dict[str, Any]:
         dialogues = {
             "mira": {
-                "line": "Thanks for helping me look for the seed pouch.",
+                "line": "Good to see you. I am checking the workshop list before the afternoon.",
                 "choices": [
-                    ("ask_about_seeds", "Ask About Seeds"),
-                    ("share_clue", "Share a Clue"),
-                    ("offer_help", "Offer Help"),
-                    ("bye", "Say Goodbye"),
+                    ("greet", "Greet"),
+                    ("ask_about_work", "Ask About Work"),
+                    ("ask_about_village", "Ask About Village"),
+                    ("goodbye", "Goodbye"),
                 ],
             },
             "tomo": {
-                "line": "I was by the Farm this morning. I remember the warehouse door being open.",
+                "line": "Morning. I am keeping an eye on the fields while the weather holds.",
                 "choices": [
-                    ("ask_what_he_saw", "Ask What He Saw"),
-                    ("thank_him", "Thank Him"),
-                    ("bye", "Say Goodbye"),
+                    ("greet", "Greet"),
+                    ("ask_about_work", "Ask About Work"),
+                    ("ask_about_village", "Ask About Village"),
+                    ("goodbye", "Goodbye"),
                 ],
             },
             "ivo": {
-                "line": "I think I saw a cat near the warehouse last night.",
+                "line": "Welcome in. If you need a warm meal or a local story, you came to the right place.",
                 "choices": [
-                    ("ask_about_cat", "Ask About the Cat"),
-                    ("share_note", "Share a Note"),
-                    ("bye", "Say Goodbye"),
+                    ("greet", "Greet"),
+                    ("ask_about_work", "Ask About Work"),
+                    ("ask_about_village", "Ask About Village"),
+                    ("goodbye", "Goodbye"),
                 ],
             },
         }
@@ -1541,6 +1543,30 @@ class WorldSimulation:
                 for choice_id, text in dialogue["choices"]
             ],
         }
+
+    def _dialogue_choice_response(self, npc_id: str, choice_id: str) -> str:
+        responses = {
+            "mira": {
+                "greet": "Mira gives a small nod and relaxes her shoulders.",
+                "ask_about_work": "Mira says the workshop is quiet, which is exactly how she likes it.",
+                "ask_about_village": "Mira says the village works best when everyone keeps their promises.",
+                "goodbye": "You step back from Mira's workbench.",
+            },
+            "tomo": {
+                "greet": "Tomo smiles briefly, then glances back toward the fields.",
+                "ask_about_work": "Tomo says the farm always has one more task waiting.",
+                "ask_about_village": "Tomo says people here notice everything, even when they pretend not to.",
+                "goodbye": "You let Tomo get back to his field work.",
+            },
+            "ivo": {
+                "greet": "Ivo welcomes you like an old regular.",
+                "ask_about_work": "Ivo says the tavern runs on warm food and careful listening.",
+                "ask_about_village": "Ivo says every village story changes a little by sunset.",
+                "goodbye": "You leave Ivo to tend the tavern.",
+            },
+        }
+        npc_responses = responses.get(npc_id, {})
+        return npc_responses.get(choice_id, "They nod and return to their day.")
 
     def _add_player_note(
         self,

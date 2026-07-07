@@ -48,26 +48,32 @@ Valid interactions return:
   "type": "dialogue_opened",
   "npc_id": "mira",
   "speaker": "Mira",
-  "line": "Thanks for helping me look for the seed pouch.",
+  "line": "Good to see you. I am checking the workshop list before the afternoon.",
   "choices": [
-    { "choice_id": "offer_help", "text": "Offer Help" }
+    { "choice_id": "greet", "text": "Greet" },
+    { "choice_id": "ask_about_work", "text": "Ask About Work" },
+    { "choice_id": "ask_about_village", "text": "Ask About Village" },
+    { "choice_id": "goodbye", "text": "Goodbye" }
   ]
 }
 ```
 
 ### `dialogue_choice`
 
-Applies deterministic MVP effects and may return a `world_diff`.
+Applies deterministic MVP dialogue feedback and may return a `world_diff`.
 
 ```json
-{ "type": "dialogue_choice", "npc_id": "ivo", "choice_id": "ask_about_cat" }
+{ "type": "dialogue_choice", "npc_id": "ivo", "choice_id": "ask_about_village" }
 ```
 
-Current effects:
+Current default v1 dialogue choices are normal conversation topics:
 
-- Mira `offer_help`: writes a warm memory for Mira.
-- Tomo `ask_what_he_saw`: adds a player note about the warehouse door.
-- Ivo `ask_about_cat`: adds a player note about a cat near the Warehouse.
+- `greet`
+- `ask_about_work`
+- `ask_about_village`
+- `goodbye`
+
+Missing Seeds-specific choices and Agent-driven follow-up actions are intentionally not the default playable path for v1. They should be layered in after normal NPC conversation feels good.
 
 ### Other Playable Commands
 
