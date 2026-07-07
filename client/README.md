@@ -1,10 +1,70 @@
 # Godot Client
 
-This is the current Godot 4.x display client for the deterministic world server.
+This is the current Godot 4.x playable client for Echo Hollow.
+
+## Current Slice
+
+Playable World v0 is a local Godot scene with:
+
+- WASD player movement.
+- 4-direction player walking animation.
+- camera follow.
+- village square tile/prop art.
+- simple collision for major props.
+- Mira, Tomo, and Ivo as deterministic NPCs.
+- lightweight agent state bubbles above NPCs.
+
+The client can run without the backend. When the backend server is available, it also connects to:
+
+```text
+ws://127.0.0.1:8000/ws/world/demo_world_001
+```
+
+## Controls
+
+- `WASD`: move player.
+- `E`: interact with nearest NPC.
+- `B`: toggle NPC state bubbles.
+- `1`: jump to Square.
+- `2`: jump to Tavern.
+- `3`: jump to Farm.
+- `4`: jump to Workshop.
+- `5`: jump to Warehouse.
+
+Number keys are debug helpers for logical location and backend contract checks. Normal play should use WASD.
+
+## Asset Contract
+
+Runtime assets live under:
+
+```text
+res://assets/playable_world_v0/
+```
+
+Sprite sheets:
+
+- `sprites/player_walk_4dir_4frame.png`
+- `sprites/mira_walk_4dir_4frame.png`
+- `sprites/tomo_walk_4dir_4frame.png`
+- `sprites/ivo_walk_4dir_4frame.png`
+
+Each character sheet is `512x512`, transparent PNG, `4 columns x 4 rows`, with `128x128` cells.
+
+Rows:
+
+1. `down`
+2. `up`
+3. `left`
+4. `right`
+
+Map and prop assets:
+
+- `tiles/ground_path_tileset_48.png`
+- `props/collision_props.png`
 
 ## Runtime Contract
 
-The client expects the backend WebSocket to emit:
+The client can consume backend WebSocket messages:
 
 - `world_state`
 - `world_diff`
@@ -12,44 +72,28 @@ The client expects the backend WebSocket to emit:
 - `dialogue_result`
 - `interaction_denied`
 
-The payload fields consumed by `scripts/main.gd` are covered by `backend/tests/test_client_contract.py`.
+The backend stays authoritative for logical state. Godot owns local movement, collision, animation, camera, and visual coordinates.
 
-## Controls
-
-- `1`: Square
-- `2`: Tavern
-- `3`: Farm
-- `4`: Workshop
-- `5`: Warehouse
-
-Each key sends:
+When connected, the playable client sends:
 
 ```json
-{
-  "type": "move_player",
-  "location_id": "tavern"
-}
+{ "type": "player_entered_location", "location_id": "workshop" }
 ```
 
-## Next Playable Client Contract
+and:
 
-The backend now supports the logical messages needed for a Stardew-like client:
+```json
+{ "type": "player_interact_npc", "npc_id": "mira", "interaction": "talk" }
+```
 
-- `player_entered_location`
-- `player_interact_npc`
-- `dialogue_choice`
-- `investigate_location`
-- `wait_minutes`
-- `run_village_step`
-
-Godot should own WASD movement, collision, camera, local coordinates, animation, and NPC tweening. The backend owns logical location, interactions, memory, Director scheduling, and episode state.
-
-## Current Verification Note
-
-Godot headless verification has passed with Godot 4.7 in this environment:
+## Verification
 
 ```powershell
-godot_console --headless --path client --script res://tests/verify_client.gd
+Godot_v4.7-stable_win64_console.exe --headless --path client --script res://tests/verify_client.gd
 ```
 
-Manual visual QA should still be done by opening `project.godot` in Godot 4.x.
+Expected output:
+
+```text
+Godot playable client verification passed.
+```

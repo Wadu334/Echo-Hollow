@@ -10,7 +10,7 @@ This repository currently proves the non-LLM foundation:
 - player location updates
 - three scheduled NPCs
 - WebSocket world sync
-- Godot 2D display project
+- Godot 2D playable client with WASD movement, local collision, NPC routine visuals, and state bubbles
 - deterministic Agent v1 loop
 - VillageDirector v0 orchestration layer
 - memory, relationship, rumor, and validator state
@@ -49,6 +49,7 @@ The Director is not a God Agent. It does not change relationships, write NPC mem
 - `docs/implementation-pack.md`: staged build map from research blueprint to implementation.
 - `docs/specs/10-village-director-v0.md`: Director orchestration contract.
 - `docs/specs/12-playable-world-backend-support.md`: playable backend WebSocket and payload contracts.
+- `docs/specs/13-playable-world-client-v0.md`: Godot playable client, imported assets, movement, collision, NPC routines, and state bubbles.
 
 ## Backend Setup
 
@@ -120,7 +121,7 @@ World diffs may include:
 }
 ```
 
-Known limitation: the current Godot client still uses simple number-key movement. The backend now supports the logical messages needed by the next Stardew-like client pass. See `docs/current-state.md` for the current capability map.
+The current Godot client has a local Playable World v0 layer. WASD movement, directional animation, camera follow, collision props, deterministic NPC patrols, and state bubbles run locally in Godot. The number keys remain as debug helpers for logical location checks. See `docs/current-state.md` for the current capability map.
 
 The dashboard includes Agent Tool buttons. For example, move the player to Workshop, then use `Tell Mira: Tomo rumor` to trigger:
 
@@ -162,11 +163,10 @@ Open `client/project.godot` in Godot 4.x and run the main scene.
 
 Controls:
 
-- `1`: move player to Square
-- `2`: move player to Tavern
-- `3`: move player to Farm
-- `4`: move player to Workshop
-- `5`: move player to Warehouse
+- `WASD`: move player
+- `E`: interact with nearest NPC
+- `B`: toggle NPC state bubbles
+- `1-5`: jump to logical locations for debugging
 
 The client connects to:
 

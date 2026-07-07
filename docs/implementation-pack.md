@@ -17,6 +17,7 @@ For the current implementation snapshot, start with `current-state.md`.
 - `specs/08-agent-v0-implementation.md`: deterministic agent loop notes and borrowed agent patterns.
 - `specs/10-village-director-v0.md`: Director orchestration, pacing, fallback, and phase boundaries.
 - `specs/12-playable-world-backend-support.md`: backend contracts for a future Stardew-like Godot client.
+- `specs/13-playable-world-client-v0.md`: Godot WASD movement, imported pixel-cute assets, collision props, NPC routines, and agent state bubbles.
 
 ## Recommended Build Order
 
@@ -32,17 +33,17 @@ Completed foundation:
 8. Deterministic AgentRuntime.
 9. VillageDirector orchestration.
 10. Playable backend command support.
+11. Godot Playable World v0 with local WASD movement, collision props, NPC patrol visuals, and deterministic state bubbles.
 
 Recommended next build order:
 
-1. Implement Godot WASD player controller.
-2. Add collision and logical location trigger areas.
-3. Add proximity NPC interaction and dialogue UI.
-4. Tween NPCs from `actor_movements`.
-5. Add HUD presentation and toast display.
-6. Add debug overlay for world/Director state.
-7. Add persistence after the playable loop feels good.
-8. Add LLM texture only after deterministic play remains stable.
+1. Add polished dialogue UI choices.
+2. Add visible logical location trigger areas and interaction affordances.
+3. Tween NPCs from backend `actor_movements`.
+4. Add HUD presentation and toast display.
+5. Add debug overlay for world/Director state.
+6. Add persistence after the playable loop feels good.
+7. Add LLM texture only after deterministic play remains stable.
 
 ## Minimal Runtime Resources
 
@@ -88,4 +89,4 @@ Build the playable Godot client layer:
 WASD movement -> trigger logical locations -> interact with NPCs -> dialogue choices -> world_diff/presentation feedback
 ```
 
-Do not integrate LLM until the playable loop is stable without it.
+The first WASD/collision/NPC-state slice now exists. Continue with dialogue choices, richer location triggers, and backend-driven NPC tweening. Do not integrate LLM until the playable loop is stable without it.

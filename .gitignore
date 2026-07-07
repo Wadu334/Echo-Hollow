@@ -5,6 +5,6 @@ __pycache__/
 .ruff_cache/
 .venv/
 tmp/
+moodboards/
 .env
 .env.*
-

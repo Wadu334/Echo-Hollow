@@ -84,14 +84,19 @@ Snapshots and diffs include:
 
 ## Client State
 
-The current Godot client is still a simple display client:
+The current Godot client now has a local Playable World v0 layer:
 
-- number keys `1-5` move the player between logical locations
-- actors are drawn at location anchors
-- side panel shows episode/action/relationship information
-- headless verification passes
+- `WASD` moves a `CharacterBody2D` player in the village square.
+- Player animation changes by facing direction: down, up, left, and right.
+- Pixel-cute assets are imported under `client/assets/playable_world_v0/`.
+- Major props have simple collision: well, noticeboard, crate, bench, fence, and lamp.
+- Mira, Tomo, and Ivo spawn as NPCs with deterministic patrol/idle routines.
+- NPCs show lightweight deterministic state bubbles for mood, memory, rumor, and relationship placeholders.
+- `B` toggles state bubbles; `E` interacts with the nearest NPC when close enough.
+- Number keys `1-5` still jump to logical locations for debugging and backend contract checks.
+- Headless verification passes.
 
-The backend is ready for the next client pass, but WASD movement, collision, camera follow, NPC tweening, dialogue box UI, HUD, and debug overlay still need to be implemented in Godot.
+The backend is still not a per-frame coordinate server. Godot owns movement, collision, animation, camera, and local visual coordinates. The backend owns logical location, interactions, memory, relationships, rumors, Director scheduling, episode state, and event log.
 
 ## Public Contracts
 
@@ -162,26 +167,24 @@ Expected current result:
 
 - backend tests pass
 - `probe_episode.py` reaches `resolved_reconciled`
-- Godot headless prints `Godot client verification passed.`
+- Godot headless prints `Godot playable client verification passed.`
 
 ## Current Limitations
 
 - No database persistence yet.
 - No real LLM integration yet.
-- Godot client does not yet have WASD movement or collision.
 - Backend does not simulate per-frame coordinates by design.
-- Dialogue is deterministic MVP content.
-- Visual assets are placeholders.
+- Dialogue is deterministic MVP content and still needs a polished choice UI.
+- NPC state bubbles currently use deterministic placeholder text until connected to richer memory, rumor, relationship, and Director summaries.
+- NPC backend movement diffs are not yet tweened into local paths.
 
 ## Recommended Next Goal
 
-Implement Godot Playable Client v0:
+Implement Playable World v1:
 
-- WASD `CharacterBody2D` player movement.
-- Collision and location trigger areas.
-- Send `player_entered_location` when entering logical regions.
-- Proximity interaction key for NPCs.
-- Dialogue box and choice UI.
-- Tween NPCs from `actor_movements`.
-- HUD for `presentation` and toasts.
-- Debug overlay for `world_diff`, Director trace, and action queue.
+- Add polished dialogue box and choice UI.
+- Add visible logical location trigger areas and interaction affordances.
+- Tween NPCs from backend `actor_movements`.
+- Replace placeholder bubbles with compact memory, rumor, relationship, and Director trace summaries.
+- Add HUD for `presentation` and toasts.
+- Add debug overlay for `world_diff`, Director trace, and action queue.
