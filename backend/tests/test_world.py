@@ -28,6 +28,30 @@ class WorldSimulationTests(unittest.TestCase):
         self.assertEqual(diff["npcs"]["mira"]["current_location"], "tavern")
         self.assertEqual(diff["npcs"]["tomo"]["current_location"], "tavern")
         self.assertTrue(any(event["type"] == "npc_schedule_changed" for event in world.events(limit=20)))
+        movement_by_actor = {
+            movement["actor_id"]: movement
+            for movement in diff["actor_movements"]
+        }
+        self.assertEqual(movement_by_actor["mira"]["from_location"], "workshop")
+        self.assertEqual(movement_by_actor["mira"]["to_location"], "tavern")
+        self.assertEqual(movement_by_actor["mira"]["reason"], "schedule")
+
+    def test_wait_minutes_preserves_schedule_actor_movements(self) -> None:
+        world = WorldSimulation()
+        world.minute_of_day = 11 * 60 + 59
+
+        diff = world.wait_minutes(1)
+
+        movement_by_actor = {
+            movement["actor_id"]: movement
+            for movement in diff["actor_movements"]
+        }
+        self.assertEqual(diff["reason"], "wait_completed")
+        self.assertIn("mira", diff["changed_actor_ids"])
+        self.assertEqual(world.npcs["mira"].current_location, "tavern")
+        self.assertEqual(movement_by_actor["mira"]["from_location"], "workshop")
+        self.assertEqual(movement_by_actor["mira"]["to_location"], "tavern")
+        self.assertEqual(movement_by_actor["mira"]["reason"], "schedule")
 
     def test_player_movement_is_validated_by_location_graph(self) -> None:
         world = WorldSimulation()

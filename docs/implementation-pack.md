@@ -19,6 +19,7 @@ For the current implementation snapshot, start with `current-state.md`.
 - `specs/12-playable-world-backend-support.md`: backend contracts for a future Stardew-like Godot client.
 - `specs/13-playable-world-client-v0.md`: Godot WASD movement, imported pixel-cute assets, collision props, NPC routines, and agent state bubbles.
 - `specs/14-playable-world-v1-goal.md`: next playable loop goal, UX copy direction, and acceptance criteria.
+- `specs/15-playable-world-v2-rumor-handoff.md`: connection-scoped dialogue, authoritative movement reconciliation, rumor handoff, and the visible Mira-to-Tomo consequence.
 
 ## Recommended Build Order
 
@@ -35,17 +36,17 @@ Completed foundation:
 9. VillageDirector orchestration.
 10. Playable backend command support.
 11. Godot Playable World v0 with local WASD movement, collision props, NPC patrol visuals, and deterministic state bubbles.
+12. Playable World v1 ordinary conversation UI and player-facing feedback.
+13. Playable World v2 Ivo-to-Mira rumor handoff, stateful choices, backend-authored movement, and visible agent consequence.
 
 Recommended next build order:
 
-1. Add polished dialogue UI choices for normal NPC conversation.
-2. Add visible NPC approach prompts and conversation affordances.
-3. Add HUD and toast feedback with friendly objective copy.
-4. Add agent-driven follow-up actions after conversation.
-5. Add debug overlay for world/Director state.
-6. Add Missing Seeds investigation and evidence sharing after conversation feels good.
-7. Add persistence after the playable loop feels good.
-8. Add LLM texture only after deterministic play remains stable.
+1. Repeatedly playtest and harden the connected v2 golden path.
+2. Improve player-facing provenance and movement-rejection feedback.
+3. Extend Missing Seeds investigation and evidence sharing without weakening the conversation/session contract.
+4. Add a compact optional debug overlay for world, conversation, and Director state.
+5. Add persistence after the connected playable loop feels reliable.
+6. Add LLM texture only after deterministic play remains stable.
 
 ## Minimal Runtime Resources
 
@@ -85,10 +86,14 @@ Postgres + JSONB + pgvector remain good later targets once persistence and seman
 
 ## Immediate Next Step
 
-Build the playable Godot client layer:
+Stabilize the connected rumor-consequence slice:
 
 ```text
-WASD movement -> approach NPCs -> normal dialogue choices -> toast/HUD feedback
+Ivo rumor -> offered choice -> Mira memory -> validated fallback movement
+-> accepted Mira/Tomo talk -> visible consequence -> authoritative restore
 ```
 
-The first WASD/collision/NPC-state slice now exists. Continue with normal NPC dialogue, approach prompts, and player-facing feedback. Add Missing Seeds progression and backend-driven agent actions only after the ordinary conversation loop feels stable. Do not integrate LLM until the deterministic play loop is stable without it.
+Use `backend/scripts/verify_connected_godot.py` for a fresh, repeatable
+Godot-to-FastAPI run. Keep future work incremental: do not add a general
+cutscene framework, persistence, or LLM dialogue until the deterministic
+connected loop remains stable.

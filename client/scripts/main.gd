@@ -1,7 +1,5 @@
 extends Node2D
 
-const SERVER_URL := "ws://127.0.0.1:8000/ws/world/demo_world_001"
-
 const VIEWPORT_SIZE := Vector2(960, 640)
 const WORLD_SIZE := Vector2(960, 672)
 const TILE_SIZE := 48
@@ -50,7 +48,7 @@ const LOCATION_NAMES := {
 }
 
 const LOCATION_CENTERS := {
-	"square": Vector2(480, 340),
+	"square": Vector2(480, 300),
 	"tavern": Vector2(176, 210),
 	"farm": Vector2(790, 430),
 	"workshop": Vector2(230, 500),
@@ -143,24 +141,32 @@ const NPC_BUBBLES := {
 	},
 }
 
-var socket := WebSocketPeer.new()
 var connected := false
+var has_connected_once := false
 var world_data: Dictionary = {}
 var actor_nodes: Dictionary = {}
 var actor_state: Dictionary = {}
+var actor_tweens: Dictionary = {}
+var authoritative_actor_locations: Dictionary = {}
 var location_nodes: Dictionary = {}
 var location_positions: Dictionary = {}
 var npc_state: Dictionary = {}
 var bubbles_visible := true
 var enable_server_connection := true
 var local_player_location := "square"
+var pending_player_location := ""
 var last_interaction_text := "Walk up to a villager and press E to talk."
 var active_dialogue_npc_id := ""
+var active_conversation_id := ""
+var active_offer_version := 0
 var toast_timer := 0.0
+var scene_transition_started := false
+var pending_rumor_scene := false
 
 var player_body: CharacterBody2D
 var tile_texture: Texture2D
 var prop_texture: Texture2D
+var world_connection: Node
 
 @onready var world_root := Node2D.new()
 @onready var tile_root := Node2D.new()
@@ -188,6 +194,7 @@ func _ready() -> void:
 	_spawn_npcs()
 	_update_bubble_visibility()
 	if enable_server_connection:
+		_bind_world_connection()
 		_attempt_server_connection()
 	else:
 		status_label.text = "Echo Hollow | Offline Demo | Square"
@@ -195,7 +202,6 @@ func _ready() -> void:
 
 
 func _physics_process(delta: float) -> void:
-	_poll_socket()
 	_update_player_movement(delta)
 	_update_npc_routines(delta)
 	_update_player_location()
@@ -249,28 +255,118 @@ func _load_png_texture(res_path: String) -> Texture2D:
 
 
 func _attempt_server_connection() -> void:
-	var err := socket.connect_to_url(SERVER_URL)
-	if err != OK:
+	if world_connection == null:
 		status_label.text = "Echo Hollow | Offline Demo | Square"
-		objective_label.text = "Server connection failed. Local movement is still available."
+		objective_label.text = "Persistent world connection is unavailable."
+		return
+	status_label.text = "Echo Hollow | Connecting | Square"
+	objective_label.text = "Connecting to the village server..."
+	world_connection.ensure_connected()
+
+
+func _bind_world_connection() -> void:
+	world_connection = get_node_or_null("/root/WorldConnection")
+	if world_connection == null:
+		return
+	_connect_world_signal("connection_changed", "_on_connection_changed")
+	_connect_world_signal("world_state_received", "_on_world_state_received")
+	_connect_world_signal("world_diff_received", "_on_world_diff_received")
+	_connect_world_signal("dialogue_opened", "_on_dialogue_opened")
+	_connect_world_signal("dialogue_result", "_on_dialogue_result")
+	_connect_world_signal("dialogue_rejected", "_on_dialogue_rejected")
+	_connect_world_signal("interaction_denied", "_on_interaction_denied")
+	_connect_world_signal("client_error", "_on_client_error")
+	_connect_world_signal("rumor_consequence_ready", "_on_rumor_consequence_ready")
+
+	connected = bool(world_connection.connected)
+	if connected:
+		has_connected_once = true
+	var cached_world: Dictionary = world_connection.world_data
+	if not cached_world.is_empty():
+		_on_world_state_received(cached_world)
+
+
+func _connect_world_signal(signal_name: StringName, method_name: StringName) -> void:
+	var callable := Callable(self, method_name)
+	if not world_connection.is_connected(signal_name, callable):
+		world_connection.connect(signal_name, callable)
+
+
+func _on_connection_changed(is_connected: bool) -> void:
+	connected = is_connected
+	if connected:
+		has_connected_once = true
+		_freeze_local_npcs()
+		var cached_world: Dictionary = world_connection.world_data
+		if not cached_world.is_empty():
+			_on_world_state_received(cached_world)
+	elif has_connected_once:
+		pending_rumor_scene = false
+		_freeze_local_npcs()
+		_close_dialogue()
+
+
+func _on_world_state_received(data: Dictionary) -> void:
+	world_data = data.duplicate(true)
+	_reconcile_authoritative_world({}, true)
+
+
+func _on_world_diff_received(diff: Dictionary) -> void:
+	if world_connection != null:
+		world_data = world_connection.world_data.duplicate(true)
 	else:
-		status_label.text = "Echo Hollow | Connecting | Square"
-		objective_label.text = "Connecting to the village server..."
+		_merge_world_diff(diff)
+	_reconcile_authoritative_world(diff, false)
 
 
-func _poll_socket() -> void:
-	socket.poll()
-	var state := socket.get_ready_state()
-	if state == WebSocketPeer.STATE_OPEN and not connected:
-		connected = true
-	elif state == WebSocketPeer.STATE_CLOSED and connected:
-		connected = false
+func _on_dialogue_opened(message: Dictionary) -> void:
+	last_interaction_text = "%s says: %s" % [message.get("speaker", "Villager"), message.get("line", "")]
+	_show_dialogue(message)
 
-	while socket.get_available_packet_count() > 0:
-		var packet := socket.get_packet().get_string_from_utf8()
-		var parsed = JSON.parse_string(packet)
-		if typeof(parsed) == TYPE_DICTIONARY:
-			_apply_server_message(parsed)
+
+func _on_dialogue_result(message: Dictionary) -> void:
+	last_interaction_text = str(message.get("display_text", message.get("toast", "Choice noted.")))
+	_show_dialogue_result(message)
+
+
+func _on_dialogue_rejected(message: Dictionary) -> void:
+	var text := str(message.get("display_text", "That conversation choice is no longer available."))
+	_show_toast(text)
+	if message.has("conversation_id") and message.has("offer_version") and message.has("choices"):
+		_show_dialogue(message)
+	else:
+		_close_dialogue()
+
+
+func _on_interaction_denied(message: Dictionary) -> void:
+	last_interaction_text = str(message.get("display_text", "Not close enough."))
+	_show_toast(last_interaction_text)
+
+
+func _on_client_error(message: Dictionary) -> void:
+	_show_toast(str(message.get("display_text", message.get("error", "Village server error."))))
+
+
+func _on_rumor_consequence_ready(_payload: Dictionary) -> void:
+	if scene_transition_started:
+		return
+	if actor_tweens.has("mira"):
+		pending_rumor_scene = true
+		return
+	scene_transition_started = true
+	call_deferred("_open_rumor_consequence_scene")
+
+
+func _open_rumor_consequence_scene() -> void:
+	if world_connection == null or not connected:
+		scene_transition_started = false
+		pending_rumor_scene = false
+		return
+	_close_dialogue()
+	var error := get_tree().change_scene_to_file("res://scenes/rumor_consequence.tscn")
+	if error != OK:
+		scene_transition_started = false
+		_show_toast("The rumor consequence scene could not be opened.")
 
 
 func _build_world_scene() -> void:
@@ -608,6 +704,8 @@ func _update_player_movement(delta: float) -> void:
 
 
 func _update_npc_routines(delta: float) -> void:
+	if connected or has_connected_once:
+		return
 	for npc_id in NPC_ROUTINES.keys():
 		var body: CharacterBody2D = actor_nodes.get(npc_id, null)
 		if body == null:
@@ -639,6 +737,20 @@ func _update_npc_routines(delta: float) -> void:
 		body.velocity = movement * NPC_SPEED
 		body.move_and_slide()
 		_update_actor_animation(npc_id, movement, delta)
+
+
+func _freeze_local_npcs() -> void:
+	for npc_id in ["mira", "tomo", "ivo"]:
+		if actor_tweens.has(npc_id):
+			var existing_tween: Tween = actor_tweens[npc_id]
+			if existing_tween != null and existing_tween.is_valid():
+				existing_tween.kill()
+			actor_tweens.erase(npc_id)
+		var body: CharacterBody2D = actor_nodes.get(npc_id, null)
+		if body == null:
+			continue
+		body.velocity = Vector2.ZERO
+		_update_actor_animation(npc_id, Vector2.ZERO, 0.0)
 
 
 func _update_actor_animation(actor_id: String, movement: Vector2, delta: float) -> void:
@@ -673,9 +785,12 @@ func _update_player_location() -> void:
 	for location_id in LOCATION_RECTS.keys():
 		var rect: Rect2 = LOCATION_RECTS[location_id]
 		if rect.has_point(player_body.position):
-			if local_player_location != location_id:
+			if connected:
+				if local_player_location != location_id and pending_player_location != location_id:
+					pending_player_location = location_id
+					_send_location_entered(location_id)
+			elif local_player_location != location_id:
 				local_player_location = location_id
-				_send_location_entered(location_id)
 			return
 
 
@@ -683,8 +798,12 @@ func _jump_player_to_location(location_id: String) -> void:
 	if not LOCATION_CENTERS.has(location_id):
 		return
 	player_body.position = LOCATION_CENTERS[location_id]
-	local_player_location = location_id
-	_send_location_entered(location_id)
+	if connected:
+		if pending_player_location != location_id:
+			pending_player_location = location_id
+			_send_location_entered(location_id)
+	else:
+		local_player_location = location_id
 
 
 func _update_bubble_visibility() -> void:
@@ -762,25 +881,27 @@ func _show_toast(text: String) -> void:
 
 func _apply_server_message(message: Dictionary) -> void:
 	var payload = message.get("data", {})
-	if typeof(payload) != TYPE_DICTIONARY:
-		return
-
 	if message.get("type") == "world_state":
-		world_data = payload
+		if typeof(payload) == TYPE_DICTIONARY:
+			_on_world_state_received(payload)
 	elif message.get("type") == "world_diff":
-		_merge_world_diff(payload)
+		if typeof(payload) == TYPE_DICTIONARY:
+			_merge_world_diff(payload)
+			_reconcile_authoritative_world(payload, false)
 	elif message.get("type") == "dialogue_opened":
-		last_interaction_text = "%s says: %s" % [message.get("speaker", "Villager"), message.get("line", "")]
-		_show_dialogue(message)
+		_on_dialogue_opened(message)
 	elif message.get("type") == "dialogue_result":
-		last_interaction_text = str(message.get("display_text", message.get("toast", "Choice noted.")))
 		var result_diff = message.get("world_diff", {})
 		if typeof(result_diff) == TYPE_DICTIONARY:
 			_merge_world_diff(result_diff)
-		_show_dialogue_result(message)
+			_reconcile_authoritative_world(result_diff, false)
+		_on_dialogue_result(message)
+	elif message.get("type") == "dialogue_rejected":
+		_on_dialogue_rejected(message)
 	elif message.get("type") == "interaction_denied":
-		last_interaction_text = str(message.get("display_text", "Not close enough."))
-		_show_toast(last_interaction_text)
+		_on_interaction_denied(message)
+	elif message.get("type") == "client_error":
+		_on_client_error(message)
 	else:
 		return
 
@@ -790,6 +911,8 @@ func _apply_server_message(message: Dictionary) -> void:
 
 func _show_dialogue(message: Dictionary) -> void:
 	active_dialogue_npc_id = str(message.get("npc_id", ""))
+	active_conversation_id = str(message.get("conversation_id", ""))
+	active_offer_version = int(message.get("offer_version", 0))
 	dialogue_title_label.text = str(message.get("speaker", "Villager"))
 	dialogue_line_label.text = str(message.get("line", "Hello."))
 	_rebuild_dialogue_choices(message.get("choices", []))
@@ -801,8 +924,17 @@ func _show_dialogue_result(message: Dictionary) -> void:
 	var text := str(message.get("display_text", message.get("toast", "Choice noted.")))
 	dialogue_line_label.text = text
 	_show_toast(text)
-	if str(message.get("choice_id", "")) == "goodbye":
+	if bool(message.get("conversation_closed", false)) or str(message.get("choice_id", "")) in ["goodbye", "share_ivo_claim"]:
 		_close_dialogue()
+		return
+	if message.has("conversation_id"):
+		active_conversation_id = str(message.get("conversation_id", active_conversation_id))
+	if message.has("offer_version"):
+		active_offer_version = int(message.get("offer_version", active_offer_version))
+	elif message.has("next_offer_version"):
+		active_offer_version = int(message.get("next_offer_version", active_offer_version))
+	if message.has("choices"):
+		_rebuild_dialogue_choices(message.get("choices", []))
 
 
 func _rebuild_dialogue_choices(choices: Variant) -> void:
@@ -839,6 +971,8 @@ func _choose_dialogue_by_number(index: int) -> void:
 func _close_dialogue() -> void:
 	dialogue_panel.visible = false
 	active_dialogue_npc_id = ""
+	active_conversation_id = ""
+	active_offer_version = 0
 	last_interaction_text = "Walk up to a villager and press E to talk."
 
 
@@ -868,6 +1002,128 @@ func _merge_world_diff(diff: Dictionary) -> void:
 			world_data[key] = diff[key]
 
 
+func _reconcile_authoritative_world(diff: Dictionary, force_snap: bool) -> void:
+	var player_data = world_data.get("player", {})
+	if typeof(player_data) == TYPE_DICTIONARY:
+		var authoritative_player_location := str(player_data.get("current_location", local_player_location))
+		var previous_player_location := str(authoritative_actor_locations.get("player", ""))
+		var rejection_reason := str(diff.get("reason", ""))
+		var location_rejected := rejection_reason in [
+			"not_reachable",
+			"location_not_found",
+			"invalid_location",
+		]
+		var player_move_resolved := rejection_reason == "player_moved"
+		var pending_was_accepted := (
+			player_move_resolved
+			and not pending_player_location.is_empty()
+			and pending_player_location == authoritative_player_location
+		)
+		var should_snap_player := force_snap or previous_player_location.is_empty()
+		if location_rejected:
+			should_snap_player = true
+		elif player_move_resolved and not pending_player_location.is_empty() and not pending_was_accepted:
+			should_snap_player = true
+		elif previous_player_location != authoritative_player_location and pending_player_location.is_empty():
+			should_snap_player = true
+		if should_snap_player:
+			_snap_actor_to_location("player", authoritative_player_location)
+		if force_snap or location_rejected or player_move_resolved:
+			pending_player_location = ""
+		local_player_location = authoritative_player_location
+		authoritative_actor_locations["player"] = authoritative_player_location
+
+	var movements_by_actor: Dictionary = {}
+	var actor_movements = diff.get("actor_movements", [])
+	if typeof(actor_movements) == TYPE_ARRAY:
+		for movement_value in actor_movements:
+			if typeof(movement_value) != TYPE_DICTIONARY:
+				continue
+			var movement: Dictionary = movement_value
+			var movement_actor_id := str(movement.get("actor_id", ""))
+			if movement_actor_id in ["mira", "tomo", "ivo"]:
+				movements_by_actor[movement_actor_id] = movement
+
+	var npcs = world_data.get("npcs", {})
+	if typeof(npcs) == TYPE_DICTIONARY:
+		for npc_id in ["mira", "tomo", "ivo"]:
+			var npc_data: Dictionary = npcs.get(npc_id, {})
+			var authoritative_location := str(npc_data.get("current_location", ""))
+			if authoritative_location.is_empty() or not LOCATION_CENTERS.has(authoritative_location):
+				continue
+			var previous_location := str(authoritative_actor_locations.get(npc_id, ""))
+			var movement: Dictionary = movements_by_actor.get(npc_id, {})
+			if force_snap or previous_location.is_empty():
+				_snap_actor_to_location(npc_id, authoritative_location)
+			elif not movement.is_empty():
+				if str(movement.get("to_location", "")) == authoritative_location:
+					_tween_actor_to_location(npc_id, authoritative_location, movement)
+					var display_text := str(movement.get("display_text", ""))
+					if not display_text.is_empty():
+						_show_toast(display_text)
+				else:
+					_snap_actor_to_location(npc_id, authoritative_location)
+			elif previous_location != authoritative_location:
+				_snap_actor_to_location(npc_id, authoritative_location)
+			authoritative_actor_locations[npc_id] = authoritative_location
+
+	if not active_dialogue_npc_id.is_empty() and typeof(npcs) == TYPE_DICTIONARY:
+		var active_npc: Dictionary = npcs.get(active_dialogue_npc_id, {})
+		if str(active_npc.get("current_location", "")) != local_player_location:
+			_close_dialogue()
+
+	_sync_bubbles_from_world()
+	_render_events(world_data.get("latest_events", []))
+
+
+func _snap_actor_to_location(actor_id: String, location_id: String) -> void:
+	if not actor_nodes.has(actor_id) or not LOCATION_CENTERS.has(location_id):
+		return
+	if actor_tweens.has(actor_id):
+		var existing_tween: Tween = actor_tweens[actor_id]
+		if existing_tween != null and existing_tween.is_valid():
+			existing_tween.kill()
+		actor_tweens.erase(actor_id)
+	var body: CharacterBody2D = actor_nodes[actor_id]
+	body.position = LOCATION_CENTERS[location_id]
+	body.velocity = Vector2.ZERO
+	_on_actor_motion_settled(actor_id)
+
+
+func _tween_actor_to_location(actor_id: String, location_id: String, movement: Dictionary) -> void:
+	if not actor_nodes.has(actor_id) or not LOCATION_CENTERS.has(location_id):
+		return
+	if actor_tweens.has(actor_id):
+		var existing_tween: Tween = actor_tweens[actor_id]
+		if existing_tween != null and existing_tween.is_valid():
+			existing_tween.kill()
+	var body: CharacterBody2D = actor_nodes[actor_id]
+	var target_position: Vector2 = LOCATION_CENTERS[location_id]
+	var direction := target_position - body.position
+	var duration := clampf(float(movement.get("duration_seconds", 0.4)), 0.05, 6.0)
+	body.velocity = Vector2.ZERO
+	_update_actor_animation(actor_id, direction.normalized(), 0.1)
+	var tween := create_tween()
+	tween.set_trans(Tween.TRANS_SINE)
+	tween.set_ease(Tween.EASE_IN_OUT)
+	tween.tween_property(body, "position", target_position, duration)
+	tween.finished.connect(_on_actor_tween_finished.bind(actor_id))
+	actor_tweens[actor_id] = tween
+
+
+func _on_actor_tween_finished(actor_id: String) -> void:
+	actor_tweens.erase(actor_id)
+	_on_actor_motion_settled(actor_id)
+
+
+func _on_actor_motion_settled(actor_id: String) -> void:
+	_update_actor_animation(actor_id, Vector2.ZERO, 0.0)
+	if actor_id == "mira" and pending_rumor_scene and not scene_transition_started:
+		pending_rumor_scene = false
+		scene_transition_started = true
+		call_deferred("_open_rumor_consequence_scene")
+
+
 func _sync_bubbles_from_world() -> void:
 	var npcs = world_data.get("npcs", {})
 	if typeof(npcs) != TYPE_DICTIONARY:
@@ -881,12 +1137,24 @@ func _sync_bubbles_from_world() -> void:
 		if bubble == null:
 			continue
 		var label: Label = bubble.get_node("StateLabel")
-		var local_data: Dictionary = NPC_BUBBLES.get(npc_id, {})
+		var memory_count := 0
+		var memories: Dictionary = world_data.get("memories", {})
+		for memory_value in memories.values():
+			if typeof(memory_value) == TYPE_DICTIONARY and str(memory_value.get("owner_id", "")) == npc_id:
+				memory_count += 1
+		var rumor_count := 0
+		var rumors: Dictionary = world_data.get("rumors", {})
+		for rumor_value in rumors.values():
+			if typeof(rumor_value) != TYPE_DICTIONARY:
+				continue
+			var holders = rumor_value.get("current_holder_ids", [])
+			if typeof(holders) == TYPE_ARRAY and npc_id in holders:
+				rumor_count += 1
 		label.text = "%s | %s\n%s | %s" % [
-			npc_data.get("mood", local_data.get("mood", "calm")),
-			local_data.get("memory", "memory"),
-			local_data.get("rumor", "rumor"),
-			local_data.get("relationship", "+trust"),
+			npc_data.get("mood", "calm"),
+			npc_data.get("current_action", "idle"),
+			"mem %d" % memory_count,
+			"rumor %d" % rumor_count,
 		]
 
 
@@ -969,33 +1237,27 @@ func _pretty_location(location_id: String) -> String:
 
 
 func _send_location_entered(location_id: String) -> void:
-	if socket.get_ready_state() != WebSocketPeer.STATE_OPEN:
+	if world_connection == null or not connected:
 		return
-	socket.send_text(JSON.stringify({
-		"type": "player_entered_location",
-		"location_id": location_id,
-	}))
+	world_connection.send_location_intent(location_id)
 
 
 func _send_interact_npc(npc_id: String) -> void:
-	if socket.get_ready_state() != WebSocketPeer.STATE_OPEN:
+	if world_connection == null or not connected:
 		_show_toast("Village server is not connected yet.")
 		return
-	socket.send_text(JSON.stringify({
-		"type": "player_interact_npc",
-		"npc_id": npc_id,
-		"interaction": "talk",
-	}))
+	world_connection.send_interact_npc(npc_id)
 
 
 func _send_dialogue_choice(choice_id: String) -> void:
-	if active_dialogue_npc_id == "":
+	if active_dialogue_npc_id == "" or active_conversation_id == "":
 		return
-	if socket.get_ready_state() != WebSocketPeer.STATE_OPEN:
+	if world_connection == null or not connected:
 		_show_toast("Village server is not connected yet.")
 		return
-	socket.send_text(JSON.stringify({
+	world_connection.send_command({
 		"type": "dialogue_choice",
-		"npc_id": active_dialogue_npc_id,
+		"conversation_id": active_conversation_id,
+		"offer_version": active_offer_version,
 		"choice_id": choice_id,
-	}))
+	})

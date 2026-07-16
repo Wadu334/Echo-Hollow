@@ -4,24 +4,30 @@ This is the current Godot 4.x playable client for Echo Hollow.
 
 ## Current Slice
 
-Playable World v1 baseline is a local Godot scene with:
+Playable World v2 keeps the local playable scene and adds a connected vertical
+slice with:
 
 - WASD player movement.
 - 4-direction player walking animation.
 - camera follow.
 - village tile/prop art with location labels and a central path network.
 - simple collision for major props.
-- Mira, Tomo, and Ivo as deterministic NPCs.
+- Mira, Tomo, and Ivo as deterministic NPCs while offline.
 - Ivo starts near the player as the first talkable NPC.
-- a dialogue panel for normal NPC conversation choices.
+- server-generated dialogue choices with conversation and offer tokens.
 - toast feedback after dialogue choices.
 - lightweight agent state bubbles above NPCs.
+- backend-authored NPC movement reconciliation while connected.
+- a standalone Mira/Tomo rumor-consequence scene.
 
-The client can run without the backend. When the backend server is available, it also connects to:
+The client can run without the backend. `WorldConnection` owns the persistent
+WebSocket when the main scene calls `ensure_connected()`. The default URL is:
 
 ```text
 ws://127.0.0.1:8000/ws/world/demo_world_001
 ```
+
+Override it with `ECHO_HOLLOW_SERVER_URL`.
 
 ## Controls
 
@@ -74,9 +80,13 @@ The client can consume backend WebSocket messages:
 - `world_diff`
 - `dialogue_opened`
 - `dialogue_result`
+- `dialogue_rejected`
 - `interaction_denied`
+- `client_error`
 
-The backend stays authoritative for logical state. Godot owns local movement, collision, animation, camera, and visual coordinates.
+While connected, the backend is authoritative for player and NPC logical
+locations. Godot owns local movement, collision, animation, tweening, camera,
+scene changes, and visual coordinates.
 
 When connected, the playable client sends:
 
@@ -90,14 +100,28 @@ and:
 { "type": "player_interact_npc", "npc_id": "mira", "interaction": "talk" }
 ```
 
+Dialogue choices echo the server offer:
+
+```json
+{
+  "type": "dialogue_choice",
+  "conversation_id": "conv_000001",
+  "offer_version": 1,
+  "choice_id": "share_ivo_claim"
+}
+```
+
 ## Verification
 
 ```powershell
 Godot_v4.7-stable_win64_console.exe --headless --path client --script res://tests/verify_client.gd
+.\.venv\Scripts\python.exe backend\scripts\verify_connected_godot.py `
+  --godot "C:\path\to\Godot_v4.7-stable_win64_console.exe"
 ```
 
 Expected output:
 
 ```text
 Godot playable client verification passed.
+Godot connected client verification passed.
 ```

@@ -10,11 +10,12 @@ This repository currently proves the non-LLM foundation:
 - player location updates
 - three scheduled NPCs
 - WebSocket world sync
-- Godot 2D playable client with WASD movement, local collision, NPC routine visuals, and state bubbles
+- Godot 2D playable client with WASD movement, local collision, backend-authored NPC movement, and state bubbles
+- connection-scoped, stateful dialogue choices with replay protection
 - deterministic Agent v1 loop
 - VillageDirector v0 orchestration layer
 - memory, relationship, rumor, and validator state
-- missing-seeds claim -> memory -> NPC proposal -> Director scheduling -> validator -> world mutation
+- Ivo rumor -> player claim -> Mira memory -> Agent proposal -> Director fallback -> visible consequence scene
 
 LLM dialogue is intentionally not connected yet. The current agent and director loops are deterministic so the gameplay spine can be tested before model integration.
 
@@ -50,6 +51,8 @@ The Director is not a God Agent. It does not change relationships, write NPC mem
 - `docs/specs/10-village-director-v0.md`: Director orchestration contract.
 - `docs/specs/12-playable-world-backend-support.md`: playable backend WebSocket and payload contracts.
 - `docs/specs/13-playable-world-client-v0.md`: Godot playable client, imported assets, movement, collision, NPC routines, and state bubbles.
+- `docs/specs/14-playable-world-v1-goal.md`: ordinary NPC conversation goal and player-facing UX baseline.
+- `docs/specs/15-playable-world-v2-rumor-handoff.md`: stateful rumor handoff, authoritative movement reconciliation, and visible agent consequence.
 
 ## Backend Setup
 
@@ -85,11 +88,14 @@ Playable WebSocket commands:
 - `wait_minutes`: advances world time.
 - `run_village_step`: asks the VillageDirector/AgentRuntime path to run one autonomous step.
 
-Dialogue responses use this shape:
+Dialogue responses now carry a connection-owned conversation and offered-choice
+version:
 
 ```json
 {
   "type": "dialogue_opened",
+  "conversation_id": "conv_...",
+  "offer_version": 1,
   "npc_id": "mira",
   "speaker": "Mira",
   "line": "Thanks for helping me look for the seed pouch.",
@@ -98,6 +104,11 @@ Dialogue responses use this shape:
   ]
 }
 ```
+
+Choice submissions must echo `conversation_id`, `offer_version`, and
+`choice_id`. The server rejects stale, replayed, cross-session, or unoffered
+choices without mutating the world. See
+`docs/specs/15-playable-world-v2-rumor-handoff.md` for the complete contract.
 
 World diffs may include:
 
@@ -121,7 +132,13 @@ World diffs may include:
 }
 ```
 
-The current Godot client has a local Playable World v0 layer. WASD movement, directional animation, camera follow, collision props, deterministic NPC patrols, and state bubbles run locally in Godot. The number keys remain as debug helpers for logical location checks. See `docs/current-state.md` for the current capability map.
+The Godot client retains offline visual-test support. While connected, the
+backend is the only authority for player and NPC logical locations; Godot sends
+movement intent and owns only local pixels, collision, animation, tweening, and
+presentation. A persistent `WorldConnection` Autoload keeps the socket alive
+through the rumor-consequence scene. The number keys remain debug helpers for
+logical location checks. See `docs/current-state.md` for the current capability
+map.
 
 The dashboard includes Agent Tool buttons. For example, move the player to Workshop, then use `Tell Mira: Tomo rumor` to trigger:
 
@@ -142,9 +159,12 @@ director_state
 python -m unittest discover -s backend\tests
 python backend\scripts\probe_episode.py
 python backend\scripts\probe_websocket.py
+python backend\scripts\verify_connected_godot.py --godot "<Godot console path>"
 ```
 
-The probe expects the backend server to be running.
+`probe_websocket.py` expects the backend server to be running;
+`probe_episode.py` runs the deterministic simulation in-process. The connected
+Godot verification starts and stops its own fresh Uvicorn process.
 
 ## Godot Headless Verification
 
@@ -153,9 +173,13 @@ If Godot 4.x is available:
 ```powershell
 godot_console --headless --path client --quit --verbose
 godot_console --headless --path client --script res://tests/verify_client.gd
+python backend\scripts\verify_connected_godot.py --godot "godot_console"
 ```
 
-The first command confirms the project and main scene load. The second command runs a small client display contract test inside Godot.
+The first command confirms the project and main scene load. The second runs the
+offline client display contract. The third runs a real Godot-to-FastAPI
+WebSocket check, including authoritative reconciliation and the consequence
+scene transition.
 
 ## Godot Client
 
@@ -168,8 +192,10 @@ Controls:
 - `B`: toggle NPC state bubbles
 - `1-5`: jump to logical locations for debugging
 
-The client connects to:
+The client connects by default to:
 
 ```text
 ws://127.0.0.1:8000/ws/world/demo_world_001
 ```
+
+Override the URL with `ECHO_HOLLOW_SERVER_URL`.

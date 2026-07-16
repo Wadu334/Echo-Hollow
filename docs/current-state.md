@@ -2,7 +2,9 @@
 
 ## One-Line Summary
 
-Echo Hollow is now a deterministic AI-native village prototype with a FastAPI world server, VillageDirector orchestration, a Missing Seeds episode loop, and backend support for a future Stardew-like Godot client.
+Echo Hollow is now a deterministic AI-native village prototype with a FastAPI
+world server, a connected Godot client, stateful NPC dialogue, and one visible
+rumor-to-agent consequence path.
 
 No real LLM/API call is required for the current demo.
 
@@ -10,7 +12,8 @@ No real LLM/API call is required for the current demo.
 
 ```text
 Godot Client
-  -> WebSocket commands
+  -> WorldConnection Autoload
+  -> strict WebSocket commands
   -> WorldSimulation
   -> AgentRuntimeV1 proposal
   -> VillageDirector scheduling
@@ -23,7 +26,9 @@ Godot Client
 ### Responsibility Boundaries
 
 - Godot owns WASD input, collision, camera, smooth movement, animation, and local visual coordinates.
-- Backend owns logical location, NPC interactions, memory, relationships, rumors, action queue, Director scheduling, episode state, and event log.
+- While connected, the backend owns the player's and NPCs' logical locations.
+- Godot sends location intent and reconciles pixels from authoritative snapshots, diffs, and `actor_movements`.
+- Backend owns NPC interactions, conversation sessions, offered choices, memory, relationships, rumors, action queue, Director scheduling, episode state, and event log.
 - `AgentRuntimeV1` proposes local NPC intent and does not mutate world state in `propose_step`.
 - `VillageDirector` approves, skips duplicates, applies pacing budgets, plans fallback movement, and injects episode beats.
 - Validators are the hard legality gate before tool execution.
@@ -39,8 +44,19 @@ Godot Client
 - Five logical locations.
 - Three scheduled NPCs.
 - Event log, memory, relationship, and rumor state.
+- Strict WebSocket command parsing with recoverable `client_error` responses.
+- Connection-scoped `client_session_id`.
 - WebSocket `world_state` and `world_diff` sync.
 - Dashboard at `GET /`.
+
+### Stateful Dialogue
+
+- One open conversation per connected client.
+- Server-generated choices derived from current world state.
+- `conversation_id` and monotonic `offer_version` on every choice.
+- Stable rejection of cross-session, closed, stale, replayed, and unoffered choices.
+- Ivo offers the sourced Tomo claim once; Mira offers the handoff only while it remains actionable.
+- Moving the player or conversation NPC invalidates the affected conversation.
 
 ### Agent And Director
 
@@ -56,9 +72,11 @@ Godot Client
 
 Current episode paths include:
 
-- Player shares a Tomo seed-pouch claim with Mira.
-- Mira receives memory and Director schedules follow-up.
-- Rejected NPC talk can create fallback movement plus retry.
+- Ivo gives the player a sourced Tomo seed-pouch claim.
+- The player hands that claim to Mira through a stateful dialogue choice.
+- Mira receives memory and AgentRuntime proposes a follow-up.
+- Rejected remote NPC talk creates Director fallback movement plus retry.
+- Mira's accepted retry with Tomo opens a visible consequence scene in Godot.
 - Player can find torn seed bag evidence.
 - Player can share evidence with Mira.
 - Episode can resolve into reconciliation or misunderstanding paths.
@@ -84,26 +102,24 @@ Snapshots and diffs include:
 
 ## Client State
 
-The current Godot client now has a local Playable World v1 baseline:
+The Godot client now has a Playable World v2 connected baseline:
 
-- `WASD` moves a `CharacterBody2D` player in the village square.
-- Player animation changes by facing direction: down, up, left, and right.
-- Pixel-cute assets are imported under `client/assets/playable_world_v0/`.
-- Major props have simple collision: well, noticeboard, crate, bench, fence, and lamp.
-- Mira, Tomo, and Ivo spawn as NPCs with deterministic patrol/idle routines.
-- Ivo starts near the player in the Square so the first interaction is immediately discoverable.
-- Major locations have in-world labels: Square, Tavern, Farm, Workshop, and Warehouse.
-- The tile map uses a central-square path network, small atlas variations, and clipped tile regions to reduce the debug-grid look.
-- NPCs show lightweight deterministic state bubbles for mood, memory, rumor, and relationship placeholders.
-- `E` opens a dialogue panel with normal conversation topics when the player is close enough.
-- Normal v1 dialogue choices are `greet`, `ask_about_work`, `ask_about_village`, and `goodbye`.
-- Dialogue choices show a player-facing response and toast.
-- `B` toggles state bubbles.
-- `F11` toggles fullscreen.
-- Number keys `1-5` still jump to logical locations for debugging and backend contract checks.
-- Headless verification passes.
+- `WorldConnection` owns one WebSocket across scene changes and caches the latest authoritative state.
+- `ECHO_HOLLOW_SERVER_URL` overrides the default local world socket.
+- The main scene still supports offline visual and headless checks without opening a socket.
+- While connected, local area crossing sends intent; only a backend state or diff commits logical location.
+- NPC local patrol stops after connection and backend-authored location changes are tweened from `actor_movements`.
+- Missing or contradictory movement metadata falls back to an authoritative snap.
+- Rejected player movement snaps the player back to the backend location.
+- Dialogue UI stores `conversation_id` and `offer_version` and submits only currently offered choices.
+- The Mira-to-Tomo `npc_dialogue_started` event triggers a real change to `rumor_consequence.tscn`.
+- The consequence scene reuses the persistent connection and shows the server-authored line, Tomo mood, and relationship summary.
+- Returning to the main scene reapplies the latest cached world state.
+- Existing WASD, collision, animation, camera, approach prompt, toast, bubbles, fullscreen, and debug location controls remain.
 
-The backend is still not a per-frame coordinate server. Godot owns movement, collision, animation, camera, and local visual coordinates. The backend owns logical location, interactions, memory, relationships, rumors, Director scheduling, episode state, and event log.
+The backend remains a logical simulation, not a per-frame coordinate server.
+Godot owns play feel and presentation; connected logical state always
+reconciles to the backend.
 
 ## Public Contracts
 
@@ -112,6 +128,8 @@ The backend is still not a per-frame coordinate server. Godot owns movement, col
 ```json
 {
   "type": "dialogue_opened",
+  "conversation_id": "conv_000001",
+  "offer_version": 1,
   "npc_id": "mira",
   "speaker": "Mira",
   "line": "Good to see you. I am checking the workshop list before the afternoon.",
@@ -124,13 +142,26 @@ The backend is still not a per-frame coordinate server. Godot owns movement, col
 }
 ```
 
-### Interaction Denied
+### Dialogue Choice
 
 ```json
 {
-  "type": "interaction_denied",
-  "reason": "not_nearby",
-  "display_text": "Mira is not close enough right now."
+  "type": "dialogue_choice",
+  "conversation_id": "conv_000001",
+  "offer_version": 1,
+  "choice_id": "share_ivo_claim"
+}
+```
+
+### Dialogue Rejected
+
+```json
+{
+  "type": "dialogue_rejected",
+  "reason": "stale_offer",
+  "conversation_id": "conv_000001",
+  "offer_version": 2,
+  "display_text": "Those dialogue choices are no longer current."
 }
 ```
 
@@ -171,6 +202,7 @@ Current verification commands:
 python -m unittest discover -s backend\tests -v
 python backend\scripts\probe_episode.py
 godot_console --headless --path client --script res://tests/verify_client.gd
+python backend\scripts\verify_connected_godot.py --godot "<Godot console path>"
 ```
 
 Expected current result:
@@ -178,31 +210,28 @@ Expected current result:
 - backend tests pass
 - `probe_episode.py` reaches `resolved_reconciled`
 - Godot headless prints `Godot playable client verification passed.`
+- connected verification prints `Godot connected client verification passed.`
+- the harness exits after terminating its temporary Uvicorn process
 
 ## Current Limitations
 
 - No database persistence yet.
 - No real LLM integration yet.
 - Backend does not simulate per-frame coordinates by design.
-- Dialogue is deterministic MVP content and still needs a polished choice UI.
-- NPC state bubbles currently use deterministic placeholder text until connected to richer memory, rumor, relationship, and Director summaries.
-- NPC backend movement diffs are not yet tweened into local paths.
+- Dialogue and consequence content remain deterministic MVP templates.
+- Actor movement uses location-anchor tweening, not pathfinding.
+- The consequence scene is specific to the Mira/Tomo rumor path, not a general cutscene engine.
+- The current connection model is one player/world and has no multiplayer controller lease.
 
 ## Recommended Next Goal
 
-Implement Playable World v1 as a normal NPC conversation prototype. See `docs/specs/14-playable-world-v1-goal.md`.
+Stabilize Playable World v2 before broadening content:
 
-First build:
+- playtest the Ivo-to-Mira handoff for clarity without debug knowledge
+- make movement tween timing and rejection feedback feel natural
+- expose compact provenance wording in the consequence scene
+- preserve deterministic replay and strict offered-choice validation
 
-- Dialogue box and choice UI backed by `dialogue_choice`.
-- Normal conversation topics such as greeting, work, village, and goodbye.
-- NPC approach prompts and predictable conversation close/re-open behavior.
-- Toast and HUD feedback in player-facing language.
-
-Then build:
-
-- Missing Seeds investigation and evidence sharing.
-- Agent-driven follow-up actions after conversations.
-- NPC visual tweening from backend `actor_movements`.
-- Compact memory, rumor, relationship, and Director summaries in NPC bubbles.
-- Optional debug overlay for `world_diff`, Director trace, and action queue.
+Do not add persistence or LLM dialogue until this connected vertical slice
+remains reliable under repeated runs. See
+`docs/specs/15-playable-world-v2-rumor-handoff.md`.

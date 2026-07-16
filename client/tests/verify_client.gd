@@ -85,9 +85,20 @@ func _run() -> void:
 	await process_frame
 	var player_state: Dictionary = main.world_data.get("player", {})
 	_expect(player_state.get("current_location", "") == "square", "Expected server state merge, got %s." % str(player_state))
+	_expect(main.local_player_location == "square", "Expected the backend snapshot to own the logical player location.")
+	_expect(
+		player.position.distance_to(main.LOCATION_CENTERS["square"]) < 1.0,
+		"Expected world_state to snap the player to the authoritative logical anchor, got %s." % str(player.position)
+	)
+	_expect(
+		main.actor_nodes["mira"].position.distance_to(main.LOCATION_CENTERS["workshop"]) < 1.0,
+		"Expected world_state to snap Mira to the authoritative Workshop."
+	)
 
 	main._apply_server_message({
 		"type": "dialogue_opened",
+		"conversation_id": "conv_test_001",
+		"offer_version": 1,
 		"npc_id": "mira",
 		"speaker": "Mira",
 		"line": "Good to see you.",
@@ -101,29 +112,174 @@ func _run() -> void:
 	await process_frame
 	_expect(main.dialogue_panel.visible, "Expected dialogue panel to open.")
 	_expect(main.active_dialogue_npc_id == "mira", "Expected active dialogue NPC.")
+	_expect(main.active_conversation_id == "conv_test_001", "Expected the dialogue conversation token.")
+	_expect(main.active_offer_version == 1, "Expected the initial offered-choice version.")
 	_expect(main.dialogue_choices_box.get_child_count() == 4, "Expected four normal dialogue choices.")
 
 	main._apply_server_message({
 		"type": "dialogue_result",
+		"conversation_id": "conv_test_001",
+		"offer_version": 2,
 		"npc_id": "mira",
 		"choice_id": "ask_about_work",
 		"display_text": "Mira says the workshop is quiet.",
+		"choices": [
+			{"choice_id": "greet", "text": "Greet"},
+			{"choice_id": "goodbye", "text": "Goodbye"},
+		],
 		"world_diff": _world_state(),
 	})
 	await process_frame
 	_expect(main.toast_label.visible, "Expected toast after dialogue choice.")
 	_expect("workshop" in main.dialogue_line_label.text, "Expected dialogue result text in panel.")
+	_expect(main.active_offer_version == 2, "Expected the refreshed offered-choice version.")
+	_expect(main.dialogue_choices_box.get_child_count() == 2, "Expected refreshed choices from the server.")
 
 	main._apply_server_message({
 		"type": "dialogue_result",
+		"conversation_id": "conv_test_001",
+		"offer_version": 2,
 		"npc_id": "mira",
 		"choice_id": "goodbye",
+		"conversation_closed": true,
 		"display_text": "You step back from Mira's workbench.",
 		"world_diff": _world_state(),
 	})
 	await process_frame
 	_expect(not main.dialogue_panel.visible, "Expected goodbye to close the dialogue panel.")
 	_expect(main.active_dialogue_npc_id == "", "Expected active dialogue NPC to clear after goodbye.")
+	_expect(main.active_conversation_id == "", "Expected the conversation token to clear after goodbye.")
+
+	var moved_state := _world_state()
+	moved_state["npcs"]["mira"]["current_location"] = "farm"
+	moved_state["actor_movements"] = [
+		{
+			"actor_id": "mira",
+			"from_location": "workshop",
+			"to_location": "farm",
+			"duration_seconds": 0.05,
+			"display_text": "Mira is heading to the Farm.",
+		},
+	]
+	main._apply_server_message({
+		"type": "world_diff",
+		"data": moved_state,
+	})
+	await create_timer(0.1).timeout
+	_expect(
+		main.actor_nodes["mira"].position.distance_to(main.LOCATION_CENTERS["farm"]) < 1.0,
+		"Expected a valid actor_movement to tween Mira to the authoritative Farm."
+	)
+	_expect("heading to the Farm" in main.toast_label.text, "Expected movement display text to become a toast.")
+
+	var mismatched_movement := _world_state()
+	mismatched_movement["actor_movements"] = [
+		{
+			"actor_id": "mira",
+			"from_location": "farm",
+			"to_location": "farm",
+			"duration_seconds": 0.05,
+		},
+	]
+	main._apply_server_message({
+		"type": "world_diff",
+		"data": mismatched_movement,
+	})
+	await process_frame
+	_expect(
+		main.actor_nodes["mira"].position.distance_to(main.LOCATION_CENTERS["workshop"]) < 1.0,
+		"Expected a movement/auth-location mismatch to snap Mira to the authoritative Workshop."
+	)
+
+	var missing_movement := _world_state()
+	missing_movement["npcs"]["mira"]["current_location"] = "farm"
+	missing_movement["actor_movements"] = []
+	main._apply_server_message({
+		"type": "world_diff",
+		"data": missing_movement,
+	})
+	await process_frame
+	_expect(
+		main.actor_nodes["mira"].position.distance_to(main.LOCATION_CENTERS["farm"]) < 1.0,
+		"Expected a changed authoritative NPC location without actor_movements to snap to the Farm."
+	)
+
+	main.connected = true
+	main.has_connected_once = true
+	main._tween_actor_to_location("mira", "workshop", {
+		"duration_seconds": 0.5,
+	})
+	await create_timer(0.05).timeout
+	var disconnected_mira_position: Vector2 = main.actor_nodes["mira"].position
+	main._on_connection_changed(false)
+	await create_timer(0.15).timeout
+	_expect(
+		main.actor_nodes["mira"].position.distance_to(disconnected_mira_position) < 0.1,
+		"Expected disconnect to stop an active authoritative NPC tween."
+	)
+	_expect(not main.actor_tweens.has("mira"), "Expected disconnect to clear Mira's active tween.")
+
+	player.position = Vector2(900, 600)
+	main.pending_player_location = "warehouse"
+	var intermediate_tick := _world_state()
+	intermediate_tick["reason"] = "tick"
+	main._apply_server_message({
+		"type": "world_diff",
+		"data": intermediate_tick,
+	})
+	await process_frame
+	_expect(
+		main.pending_player_location == "warehouse",
+		"Expected an unrelated tick to preserve the pending player location intent."
+	)
+	_expect(
+		player.position.distance_to(Vector2(900, 600)) < 1.0,
+		"Expected an unrelated tick not to snap the player before the location result."
+	)
+
+	var rejected_move := _world_state()
+	rejected_move["reason"] = "not_reachable"
+	main._apply_server_message({
+		"type": "world_diff",
+		"data": rejected_move,
+	})
+	await process_frame
+	_expect(
+		player.position.distance_to(main.LOCATION_CENTERS["square"]) < 1.0,
+		"Expected movement rejection to restore the authoritative player position."
+	)
+	_expect(main.pending_player_location == "", "Expected movement rejection to clear the pending intent.")
+
+	main.pending_rumor_scene = true
+	main.scene_transition_started = false
+	main._snap_actor_to_location("mira", "farm")
+	await process_frame
+	_expect(
+		not main.pending_rumor_scene and not main.scene_transition_started,
+		"Expected an authoritative Mira snap to consume a pending consequence transition safely."
+	)
+
+	_expect(load("res://scenes/rumor_consequence.tscn") != null, "Expected the independent rumor consequence scene.")
+	_expect(root.has_node("WorldConnection"), "Expected the persistent WorldConnection autoload.")
+	var connection = root.get_node("WorldConnection")
+	var duplicate_diff := _world_state()
+	duplicate_diff["reason"] = "tick"
+	duplicate_diff["world_minute"] = 480
+	connection._reset_session_state()
+	_expect(connection._consume_world_diff(duplicate_diff), "Expected the first authoritative diff to be consumed.")
+	_expect(
+		not connection._consume_world_diff(duplicate_diff),
+		"Expected the identical targeted/broadcast world diff to be deduplicated."
+	)
+	connection.client_session_id = "session_stale"
+	connection.active_dialogue = {"conversation_id": "conv_stale"}
+	connection.processed_event_log_ids["event_000001"] = true
+	connection.rumor_consequence_payload = {"line": "stale"}
+	connection._reset_session_state()
+	_expect(connection.client_session_id == "", "Expected reconnect reset to clear the old client session id.")
+	_expect(connection.active_dialogue.is_empty(), "Expected reconnect reset to clear stale dialogue state.")
+	_expect(connection.processed_event_log_ids.is_empty(), "Expected reconnect reset to clear event dedup state.")
+	_expect(connection.rumor_consequence_payload.is_empty(), "Expected reconnect reset to clear stale consequence data.")
 
 	if not failures.is_empty():
 		for failure in failures:

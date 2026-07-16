@@ -6,6 +6,16 @@ from backend.app.world import WorldSimulation
 
 
 class AgentLoopTests(unittest.TestCase):
+    def test_unknown_claim_is_rejected_without_defaulting_to_tomo(self) -> None:
+        world = WorldSimulation()
+        world.move_player("workshop")
+
+        diff = world.share_claim(target_id="mira", claim_id="invented_claim")
+
+        self.assertEqual(diff["reason"], "claim_not_found")
+        self.assertNotIn("mira", diff["memories"])
+        self.assertEqual(diff["action_queue"], [])
+
     def test_share_claim_requires_same_location(self) -> None:
         world = WorldSimulation()
 

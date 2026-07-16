@@ -4,11 +4,13 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
+from .protocol import ProtocolError, parse_client_message, validate_client_payload
 from .world import WorldSimulation
 
 
@@ -349,91 +351,186 @@ class WorldHub:
     def __init__(self, world: WorldSimulation) -> None:
         self.world = world
         self._clients: set[WebSocket] = set()
+        self._client_sessions: dict[WebSocket, str] = {}
         self._lock = asyncio.Lock()
+        self._dispatch_lock = asyncio.Lock()
 
-    async def connect(self, websocket: WebSocket) -> None:
+    async def connect(self, websocket: WebSocket) -> str:
         await websocket.accept()
-        async with self._lock:
-            self._clients.add(websocket)
-            snapshot = self.world.snapshot()
-        await websocket.send_json({"type": "world_state", "data": snapshot})
+        client_session_id = f"session_{uuid4().hex}"
+        async with self._dispatch_lock:
+            async with self._lock:
+                self._clients.add(websocket)
+                self._client_sessions[websocket] = client_session_id
+                snapshot = self.world.snapshot()
+            await self.send_to(
+                websocket,
+                {
+                    "type": "world_state",
+                    "client_session_id": client_session_id,
+                    "data": snapshot,
+                },
+            )
+        return client_session_id
 
     async def disconnect(self, websocket: WebSocket) -> None:
         async with self._lock:
             self._clients.discard(websocket)
+            client_session_id = self._client_sessions.pop(websocket, None)
+            if client_session_id is not None:
+                self.world.close_conversations_for_session(client_session_id)
 
     async def tick(self) -> dict[str, Any]:
-        async with self._lock:
-            diff = self.world.tick()
-        await self.broadcast({"type": "world_diff", "data": diff})
+        async with self._dispatch_lock:
+            async with self._lock:
+                diff = self.world.tick()
+            await self.broadcast({"type": "world_diff", "data": diff})
         return diff
 
-    async def handle_message(self, payload: dict[str, Any]) -> dict[str, Any]:
-        message_type = payload.get("type")
+    async def handle_text(
+        self,
+        text: str,
+        websocket: WebSocket | None = None,
+        client_session_id: str = "local",
+    ) -> dict[str, Any]:
+        try:
+            payload = parse_client_message(text)
+        except ProtocolError as error:
+            result = error.to_message()
+            async with self._dispatch_lock:
+                await self.send_to(websocket, result)
+            return result
+        return await self.handle_message(
+            payload,
+            websocket=websocket,
+            client_session_id=client_session_id,
+        )
+
+    async def handle_message(
+        self,
+        payload: Any,
+        websocket: WebSocket | None = None,
+        client_session_id: str = "local",
+    ) -> dict[str, Any]:
+        try:
+            validated = validate_client_payload(payload)
+        except ProtocolError as error:
+            result = error.to_message()
+            async with self._dispatch_lock:
+                await self.send_to(websocket, result)
+            return result
+
+        async with self._dispatch_lock:
+            return await self._handle_validated_message(
+                validated,
+                websocket=websocket,
+                client_session_id=client_session_id,
+            )
+
+    async def _handle_validated_message(
+        self,
+        validated: dict[str, Any],
+        *,
+        websocket: WebSocket | None,
+        client_session_id: str,
+    ) -> dict[str, Any]:
+        message_type = validated["type"]
         async with self._lock:
             if message_type == "move_player":
-                result = self.world.move_player(str(payload.get("location_id", "")))
+                result = self.world.move_player(validated["location_id"])
             elif message_type == "player_entered_location":
-                result = self.world.player_entered_location(str(payload.get("location_id", "")))
+                result = self.world.player_entered_location(validated["location_id"])
             elif message_type == "player_interact_npc":
                 result = self.world.player_interact_npc(
-                    npc_id=str(payload.get("npc_id", "")),
-                    interaction=str(payload.get("interaction", "talk")),
+                    npc_id=validated["npc_id"],
+                    interaction=validated["interaction"],
+                    client_session_id=client_session_id,
                 )
             elif message_type == "dialogue_choice":
                 result = self.world.dialogue_choice(
-                    npc_id=str(payload.get("npc_id", "")),
-                    choice_id=str(payload.get("choice_id", "")),
+                    conversation_id=validated["conversation_id"],
+                    offer_version=validated["offer_version"],
+                    choice_id=validated["choice_id"],
+                    client_session_id=client_session_id,
                 )
             elif message_type == "observe":
                 result = self.world.observe()
             elif message_type == "talk_to":
                 result = self.world.talk_to(
-                    target_id=str(payload.get("target_id", "")),
-                    topic=str(payload.get("topic", "missing_seeds")),
+                    target_id=validated["target_id"],
+                    topic=validated["topic"],
                 )
             elif message_type == "share_claim":
                 result = self.world.share_claim(
-                    target_id=str(payload.get("target_id", "")),
-                    claim_id=str(payload.get("claim_id", "tomo_took_seeds")),
+                    target_id=validated["target_id"],
+                    claim_id=validated["claim_id"],
                 )
             elif message_type == "gossip":
                 result = self.world.gossip(
-                    actor_id=str(payload.get("actor_id", "")),
-                    target_id=str(payload.get("target_id", "")),
-                    rumor_id=str(payload.get("rumor_id", "rumor_tomo_took_seeds")),
+                    actor_id=validated["actor_id"],
+                    target_id=validated["target_id"],
+                    rumor_id=validated["rumor_id"],
                 )
             elif message_type == "investigate":
-                result = self.world.investigate(subject_id=str(payload.get("subject_id", "")))
+                result = self.world.investigate(subject_id=validated["subject_id"])
             elif message_type == "investigate_location":
-                result = self.world.investigate_location(location_id=str(payload.get("location_id", "")))
+                result = self.world.investigate_location(location_id=validated["location_id"])
             elif message_type == "player_share_evidence":
                 result = self.world.player_share_evidence(
-                    target_id=str(payload.get("target_id", "")),
-                    evidence_id=str(payload.get("evidence_id", "torn_seed_bag")),
+                    target_id=validated["target_id"],
+                    evidence_id=validated["evidence_id"],
                 )
             elif message_type == "wait_minutes":
-                result = self.world.wait_minutes(int(payload.get("minutes", 30)))
+                result = self.world.wait_minutes(validated["minutes"])
             elif message_type == "autonomous_step":
                 result = self.world.run_autonomous_episode_step(
-                    actor_id=str(payload.get("actor_id", "mira")),
+                    actor_id=validated["actor_id"],
                 )
             elif message_type == "run_village_step":
                 result = self.world.run_autonomous_episode_step(
-                    actor_id=str(payload.get("actor_id", "mira")),
+                    actor_id=validated["actor_id"],
                 )
             else:
-                result = self.world.reject_client_message(
-                    message_type=str(message_type or "unknown"),
-                    reason="Unsupported client message type.",
-                )
-        if "type" in result and result["type"] in {"dialogue_opened", "dialogue_result", "interaction_denied"}:
-            await self.broadcast(result)
+                raise AssertionError(f"Unrouted validated message type: {message_type}")
+        if result.get("type") in {
+            "dialogue_opened",
+            "dialogue_result",
+            "dialogue_rejected",
+            "interaction_denied",
+            "client_error",
+        }:
+            await self.send_to(websocket, result)
             if "world_diff" in result:
-                await self.broadcast({"type": "world_diff", "data": result["world_diff"]})
+                await self.broadcast(
+                    {
+                        "type": "world_diff",
+                        "data": self._shared_world_diff(result["world_diff"]),
+                    }
+                )
         else:
             await self.broadcast({"type": "world_diff", "data": result})
         return result
+
+    @staticmethod
+    def _shared_world_diff(diff: dict[str, Any]) -> dict[str, Any]:
+        shared = dict(diff)
+        presentation = dict(shared.get("presentation", {}))
+        presentation["toasts"] = []
+        shared["presentation"] = presentation
+        return shared
+
+    async def send_to(
+        self,
+        websocket: WebSocket | None,
+        message: dict[str, Any],
+    ) -> None:
+        if websocket is None:
+            await self.broadcast(message)
+            return
+        try:
+            await websocket.send_json(message)
+        except RuntimeError:
+            await self.disconnect(websocket)
 
     async def broadcast(self, message: dict[str, Any]) -> None:
         stale_clients: list[WebSocket] = []
@@ -446,6 +543,9 @@ class WorldHub:
             async with self._lock:
                 for websocket in stale_clients:
                     self._clients.discard(websocket)
+                    client_session_id = self._client_sessions.pop(websocket, None)
+                    if client_session_id is not None:
+                        self.world.close_conversations_for_session(client_session_id)
 
 
 world = WorldSimulation(world_id=WORLD_ID)
@@ -532,10 +632,29 @@ async def world_socket(websocket: WebSocket, world_id: str) -> None:
         await websocket.close(code=1008)
         return
 
-    await hub.connect(websocket)
+    client_session_id = await hub.connect(websocket)
     try:
         while True:
-            payload = await websocket.receive_json()
-            await hub.handle_message(payload)
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+            text = message.get("text")
+            if not isinstance(text, str):
+                await hub.send_to(
+                    websocket,
+                    ProtocolError(
+                        "invalid_field_type",
+                        "WebSocket messages must use text JSON frames.",
+                        field="payload",
+                    ).to_message(),
+                )
+                continue
+            await hub.handle_text(
+                text,
+                websocket=websocket,
+                client_session_id=client_session_id,
+            )
     except WebSocketDisconnect:
+        pass
+    finally:
         await hub.disconnect(websocket)

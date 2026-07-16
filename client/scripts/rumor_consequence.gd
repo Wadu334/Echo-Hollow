@@ -1,0 +1,144 @@
+extends Node2D
+
+const VIEWPORT_SIZE := Vector2(960, 640)
+const ASSET_ROOT := "res://assets/playable_world_v0"
+const MIRA_SHEET := ASSET_ROOT + "/sprites/mira_walk_4dir_4frame.png"
+const TOMO_SHEET := ASSET_ROOT + "/sprites/tomo_walk_4dir_4frame.png"
+
+var world_connection: Node
+var elapsed := 0.0
+var duration_seconds := 3.5
+var returning_to_main := false
+
+
+func _ready() -> void:
+	world_connection = get_node_or_null("/root/WorldConnection")
+	if world_connection == null:
+		call_deferred("_return_to_main")
+		return
+
+	var configured_duration := OS.get_environment("ECHO_HOLLOW_CUTSCENE_DURATION").strip_edges()
+	if not configured_duration.is_empty():
+		duration_seconds = maxf(0.05, float(configured_duration))
+
+	var payload: Dictionary = world_connection.rumor_consequence_payload
+	if not bool(world_connection.connected) or payload.is_empty():
+		call_deferred("_return_to_main")
+		return
+	_build_scene(payload)
+
+
+func _process(delta: float) -> void:
+	if world_connection == null or not bool(world_connection.connected):
+		_return_to_main()
+		return
+	elapsed += delta
+	if elapsed >= duration_seconds:
+		_return_to_main()
+
+
+func _unhandled_input(event: InputEvent) -> void:
+	if event is InputEventKey and event.pressed and not event.echo:
+		if event.keycode in [KEY_SPACE, KEY_ESCAPE]:
+			_return_to_main()
+
+
+func _build_scene(payload: Dictionary) -> void:
+	var background := ColorRect.new()
+	background.color = Color(0.08, 0.07, 0.09, 1.0)
+	background.size = VIEWPORT_SIZE
+	add_child(background)
+
+	var glow := ColorRect.new()
+	glow.color = Color(0.35, 0.18, 0.16, 0.28)
+	glow.position = Vector2(120, 100)
+	glow.size = Vector2(720, 430)
+	add_child(glow)
+
+	_add_actor(MIRA_SHEET, Vector2(335, 390), false)
+	_add_actor(TOMO_SHEET, Vector2(625, 390), true)
+
+	var ui := CanvasLayer.new()
+	add_child(ui)
+
+	var title := Label.new()
+	title.text = "A Rumor Reaches Tomo"
+	title.position = Vector2(250, 72)
+	title.size = Vector2(460, 50)
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.add_theme_font_size_override("font_size", 28)
+	title.add_theme_color_override("font_color", Color(1.0, 0.88, 0.66, 1.0))
+	ui.add_child(title)
+
+	var line := Label.new()
+	line.text = "\"%s\"" % str(payload.get("line", "Mira asks Tomo about the missing seeds."))
+	line.position = Vector2(190, 148)
+	line.size = Vector2(580, 92)
+	line.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	line.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	line.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	line.add_theme_font_size_override("font_size", 17)
+	line.add_theme_color_override("font_color", Color(0.96, 0.91, 0.84, 1.0))
+	ui.add_child(line)
+
+	var mood := str(payload.get("tomo_mood", "hurt"))
+	var reaction := Label.new()
+	reaction.text = "Tomo looks %s. The accusation has landed." % mood
+	reaction.position = Vector2(250, 470)
+	reaction.size = Vector2(460, 34)
+	reaction.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	reaction.add_theme_font_size_override("font_size", 16)
+	reaction.add_theme_color_override("font_color", Color(0.90, 0.70, 0.68, 1.0))
+	ui.add_child(reaction)
+
+	var relationship: Dictionary = payload.get("relationship", {})
+	var relationship_label := Label.new()
+	relationship_label.text = "Tomo → Mira   trust %.2f   affinity %.2f" % [
+		float(relationship.get("trust", 0.0)),
+		float(relationship.get("affinity", 0.0)),
+	]
+	relationship_label.position = Vector2(250, 510)
+	relationship_label.size = Vector2(460, 28)
+	relationship_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	relationship_label.add_theme_font_size_override("font_size", 14)
+	relationship_label.add_theme_color_override("font_color", Color(0.76, 0.78, 0.80, 1.0))
+	ui.add_child(relationship_label)
+
+	var hint := Label.new()
+	hint.text = "Space / Esc to continue"
+	hint.position = Vector2(350, 588)
+	hint.size = Vector2(260, 24)
+	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	hint.add_theme_font_size_override("font_size", 12)
+	hint.add_theme_color_override("font_color", Color(0.58, 0.58, 0.62, 1.0))
+	ui.add_child(hint)
+
+
+func _add_actor(sheet_path: String, position_value: Vector2, face_left: bool) -> void:
+	var sprite := Sprite2D.new()
+	sprite.texture = _load_png_texture(sheet_path)
+	sprite.hframes = 4
+	sprite.vframes = 4
+	sprite.frame_coords = Vector2i(0, 2 if face_left else 3)
+	sprite.position = position_value
+	sprite.scale = Vector2(1.15, 1.15)
+	sprite.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	add_child(sprite)
+
+
+func _load_png_texture(res_path: String) -> Texture2D:
+	var image := Image.new()
+	var error := image.load(ProjectSettings.globalize_path(res_path))
+	if error != OK:
+		push_error("Could not load PNG texture %s: %s" % [res_path, error])
+		return null
+	return ImageTexture.create_from_image(image)
+
+
+func _return_to_main() -> void:
+	if returning_to_main:
+		return
+	returning_to_main = true
+	if world_connection != null:
+		world_connection.clear_rumor_consequence()
+	get_tree().change_scene_to_file("res://scenes/main.tscn")

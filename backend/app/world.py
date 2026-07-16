@@ -76,7 +76,7 @@ class NPCState:
 class PlayerState:
     player_id: str = "player"
     current_location: str = "square"
-    notes: list[dict[str, str]] = field(default_factory=list)
+    notes: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -225,7 +225,30 @@ class QueuedAction:
         }
 
 
+@dataclass
+class ConversationSession:
+    conversation_id: str
+    client_session_id: str
+    npc_id: str
+    status: str
+    offer_version: int
+    offered_choice_ids: list[str]
+    close_reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "conversation_id": self.conversation_id,
+            "client_session_id": self.client_session_id,
+            "npc_id": self.npc_id,
+            "status": self.status,
+            "offer_version": self.offer_version,
+            "offered_choice_ids": list(self.offered_choice_ids),
+            "close_reason": self.close_reason,
+        }
+
+
 ACTION_EXECUTABLE_STATUSES = {"proposed", "queued", "fallback_planned"}
+MAX_CLOSED_CONVERSATIONS = 64
 
 
 def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
@@ -255,8 +278,12 @@ class WorldSimulation:
         self._event_counter = 0
         self._memory_counter = 0
         self._action_counter = 0
+        self._conversation_counter = 0
         self._event_log: list[EventLogEntry] = []
         self._pending_actor_movements: list[dict[str, Any]] = []
+        self.conversations: dict[str, ConversationSession] = {}
+        self._open_conversation_by_client: dict[str, str] = {}
+        self._closed_conversation_ids: list[str] = []
         self.last_validator_result: dict[str, Any] | None = None
         self.last_agent_trace: dict[str, Any] | None = None
         self.last_director_trace: dict[str, Any] | None = None
@@ -459,7 +486,11 @@ class WorldSimulation:
                     "action": npc.current_action,
                     "goal": npc.current_goal,
                 }
-                npc.current_location = slot.location_id
+                self._change_npc_location(
+                    actor_id=npc_id,
+                    location_id=slot.location_id,
+                    movement_reason="schedule",
+                )
                 npc.current_action = slot.action
                 npc.current_goal = slot.goal
                 changed_actor_ids.append(npc.npc_id)
@@ -489,9 +520,19 @@ class WorldSimulation:
 
     def wait_minutes(self, minutes: int) -> dict[str, Any]:
         bounded_minutes = max(1, min(minutes, 12 * 60))
+        actor_movements: list[dict[str, Any]] = []
+        changed_actor_ids: set[str] = set()
         for _ in range(bounded_minutes):
-            self.tick()
-        return self._diff(reason="wait_completed", changed_actor_ids=[], latest_events_count=16)
+            tick_diff = self.tick()
+            actor_movements.extend(tick_diff.get("actor_movements", []))
+            changed_actor_ids.update(tick_diff.get("changed_actor_ids", []))
+        diff = self._diff(
+            reason="wait_completed",
+            changed_actor_ids=sorted(changed_actor_ids),
+            latest_events_count=16,
+        )
+        diff["actor_movements"] = actor_movements + diff["actor_movements"]
+        return diff
 
     def move_player(self, location_id: str) -> dict[str, Any]:
         if location_id not in self.locations:
@@ -509,6 +550,8 @@ class WorldSimulation:
 
         previous_location = self.player.current_location
         self.player.current_location = location_id
+        if previous_location != location_id:
+            self._close_conversations_for_actor(self.player.player_id, "player_moved")
         self._append_event(
             event_type="player_moved",
             actor_id=self.player.player_id,
@@ -523,7 +566,12 @@ class WorldSimulation:
     def player_entered_location(self, location_id: str) -> dict[str, Any]:
         return self.move_player(location_id)
 
-    def player_interact_npc(self, npc_id: str, interaction: str = "talk") -> dict[str, Any]:
+    def player_interact_npc(
+        self,
+        npc_id: str,
+        interaction: str = "talk",
+        client_session_id: str = "local",
+    ) -> dict[str, Any]:
         validation = self._validate_player_interaction(npc_id=npc_id, interaction=interaction)
         if not validation["accepted"]:
             return {
@@ -536,73 +584,154 @@ class WorldSimulation:
             event_type="player_interacted_npc",
             actor_id=self.player.player_id,
             target_id=npc_id,
-            payload={"interaction": interaction},
+            payload={
+                "interaction": interaction,
+                "client_session_id": client_session_id,
+            },
         )
-        return self._dialogue_payload(npc_id)
+        conversation = self._open_conversation(
+            client_session_id=client_session_id,
+            npc_id=npc_id,
+        )
+        return self._dialogue_payload(conversation)
 
-    def dialogue_choice(self, npc_id: str, choice_id: str) -> dict[str, Any]:
+    def dialogue_choice(
+        self,
+        conversation_id: str,
+        offer_version: int,
+        choice_id: str,
+        client_session_id: str = "local",
+    ) -> dict[str, Any]:
+        conversation = self.conversations.get(conversation_id)
+        if conversation is None:
+            return self._dialogue_rejection(
+                "conversation_not_found",
+                "That conversation no longer exists.",
+                conversation_id=conversation_id,
+            )
+        if conversation.client_session_id != client_session_id:
+            return self._dialogue_rejection(
+                "session_mismatch",
+                "That conversation belongs to another connection.",
+                conversation_id=conversation_id,
+            )
+        if conversation.status != "open":
+            return self._dialogue_rejection(
+                "conversation_closed",
+                "That conversation is already closed.",
+                conversation_id=conversation_id,
+            )
+        if offer_version != conversation.offer_version:
+            return self._dialogue_rejection(
+                "stale_offer",
+                "Those dialogue choices are no longer current.",
+                conversation_id=conversation_id,
+                offer_version=conversation.offer_version,
+            )
+        if choice_id not in conversation.offered_choice_ids:
+            return self._dialogue_rejection(
+                "choice_not_offered",
+                "That choice was not offered in this conversation.",
+                conversation_id=conversation_id,
+                offer_version=conversation.offer_version,
+            )
+
+        npc_id = conversation.npc_id
+        current_choice_ids = {
+            choice["choice_id"]
+            for choice in self._dialogue_choices(npc_id)
+        }
+        if choice_id not in current_choice_ids:
+            self._close_conversation(conversation, "offer_invalidated")
+            return self._dialogue_rejection(
+                "choice_not_offered",
+                "That choice is no longer available in the current world state.",
+                conversation_id=conversation_id,
+                offer_version=conversation.offer_version,
+            )
+
         validation = self._validate_player_interaction(npc_id=npc_id, interaction="talk")
         if not validation["accepted"]:
-            return {
-                "type": "interaction_denied",
-                "reason": validation["rejection_code"],
-                "display_text": validation["display_text"],
-            }
+            self._close_conversation(conversation, "interaction_invalidated")
+            return self._dialogue_rejection(
+                "interaction_invalidated",
+                validation["display_text"],
+                conversation_id=conversation_id,
+            )
 
         event_id = self._append_event(
             event_type="dialogue_choice_selected",
             actor_id=self.player.player_id,
             target_id=npc_id,
-            payload={"choice_id": choice_id},
+            payload={
+                "conversation_id": conversation_id,
+                "offer_version": offer_version,
+                "choice_id": choice_id,
+            },
         )
         toast = self._dialogue_choice_response(npc_id, choice_id)
         changed_actor_ids = [self.player.player_id, npc_id]
+        conversation_closed = choice_id in {"goodbye", "share_ivo_claim"}
 
-        if npc_id == "mira" and choice_id == "offer_help":
-            memory = self._write_memory(
-                owner_id="mira",
-                memory_type="episodic",
-                topic="missing_seeds",
-                summary="Player offered to help Mira search for the seed pouch.",
-                source_event_log_id=event_id,
-                truth_state="verified",
-                target_id="player",
-                importance=0.45,
-                emotional_valence=0.35,
-            )
-            self.director.on_memory_written(self, memory)
-            toast = "Mira remembers your offer to help."
-        elif npc_id == "tomo" and choice_id == "ask_what_he_saw":
+        if npc_id == "ivo" and choice_id == "ask_about_missing_seeds":
             self._add_player_note(
-                note_id="warehouse_door_open",
-                title="Warehouse Door",
-                text="Tomo saw the warehouse door open from the Farm.",
+                note_id="ivo_tomo_seed_claim",
+                title="Ivo's Seed Claim",
+                text="Ivo says Tomo may have taken the public seed bag.",
                 source_event_log_id=event_id,
+                claim_id="tomo_took_seeds",
+                source_actor_id="ivo",
             )
-            toast = "Tomo shared what he saw near the Farm."
-        elif npc_id == "ivo" and choice_id == "ask_about_cat":
-            self._add_player_note(
-                note_id="cat_near_warehouse",
-                title="Cat Near Warehouse",
-                text="Ivo remembers a cat near the Warehouse.",
-                source_event_log_id=event_id,
+            self._close_conversations_offering(
+                "ask_about_missing_seeds",
+                "offer_invalidated",
+                exclude_conversation_id=conversation_id,
             )
-            toast = "Ivo remembers a cat near the Warehouse."
+            toast = "Ivo quietly shares a claim about Tomo and the missing seeds."
+        elif npc_id == "mira" and choice_id == "share_ivo_claim":
+            changed_actor_ids.extend(
+                self._apply_player_claim_effect(
+                    target_id="mira",
+                    claim_id="tomo_took_seeds",
+                    source_actor_id="ivo",
+                    source_note_id="ivo_tomo_seed_claim",
+                )
+            )
+            self._close_conversations_offering(
+                "share_ivo_claim",
+                "offer_invalidated",
+                exclude_conversation_id=conversation_id,
+            )
+            toast = "Mira remembers Ivo's claim and decides to ask Tomo herself."
+
+        next_choices: list[dict[str, str]] = []
+        if conversation_closed:
+            self._close_conversation(conversation, f"choice:{choice_id}")
+        else:
+            conversation.offer_version += 1
+            next_choices = self._dialogue_choices(npc_id)
+            conversation.offered_choice_ids = [choice["choice_id"] for choice in next_choices]
 
         diff = self._diff(
             reason="dialogue_choice",
-            changed_actor_ids=changed_actor_ids,
-            latest_events_count=8,
+            changed_actor_ids=sorted(set(changed_actor_ids)),
+            latest_events_count=12,
             toasts=[toast],
         )
-        return {
+        result = {
             "type": "dialogue_result",
+            "conversation_id": conversation_id,
             "npc_id": npc_id,
             "choice_id": choice_id,
+            "accepted_offer_version": offer_version,
+            "offer_version": conversation.offer_version,
+            "choices": next_choices,
+            "conversation_closed": conversation_closed,
             "toast": toast,
             "display_text": toast,
             "world_diff": diff,
         }
+        return result
 
     def investigate_location(self, location_id: str) -> dict[str, Any]:
         return self.investigate(location_id)
@@ -657,6 +786,9 @@ class WorldSimulation:
         return self._diff(reason="dialogue_started", changed_actor_ids=[target_id], latest_events_count=2)
 
     def share_claim(self, target_id: str, claim_id: str) -> dict[str, Any]:
+        if claim_id not in self._claim_definitions():
+            return self._rejection("claim_not_found", {"claim_id": claim_id})
+
         claim = self._claim_payload(claim_id)
         validation = self._validate_tool(
             tool_name="share_memory",
@@ -667,31 +799,10 @@ class WorldSimulation:
         if not validation["accepted"]:
             return self._tool_rejection(validation)
 
-        event_id = self._append_event(
-            event_type="memory_shared",
-            actor_id=self.player.player_id,
+        changed_actor_ids = self._apply_player_claim_effect(
             target_id=target_id,
-            payload={
-                "claim_id": claim_id,
-                "topic": claim["topic"],
-                "claim": claim["summary"],
-                "claim_target_id": claim.get("claim_target_id"),
-                "truth_state": claim["truth_state"],
-            },
+            claim_id=claim_id,
         )
-        memory = self._write_memory(
-            owner_id=target_id,
-            memory_type="episodic",
-            topic=claim["topic"],
-            summary=claim["summary"],
-            source_event_log_id=event_id,
-            truth_state=claim["truth_state"],
-            target_id=claim.get("claim_target_id"),
-            importance=claim["importance"],
-            emotional_valence=claim["emotional_valence"],
-        )
-        changed_actor_ids = [target_id]
-        changed_actor_ids.extend(self._agent_planner_after_memory(memory))
         return self._diff(reason="memory_shared", changed_actor_ids=changed_actor_ids, latest_events_count=8)
 
     def gossip(self, actor_id: str, target_id: str, rumor_id: str) -> dict[str, Any]:
@@ -827,6 +938,14 @@ class WorldSimulation:
             payload={"message_type": message_type, "reason": reason},
         )
         return self._diff(reason="client_message_rejected", changed_actor_ids=[], latest_events_count=1)
+
+    def close_conversations_for_session(self, client_session_id: str) -> None:
+        conversation_id = self._open_conversation_by_client.get(client_session_id)
+        if conversation_id is None:
+            return
+        conversation = self.conversations.get(conversation_id)
+        if conversation is not None:
+            self._close_conversation(conversation, "client_disconnected")
 
     def snapshot(self) -> dict[str, Any]:
         occupants = self._location_occupants()
@@ -991,20 +1110,14 @@ class WorldSimulation:
 
     def _execute_npc_move_to(self, actor_id: str, location_id: str) -> list[str]:
         npc = self.npcs[actor_id]
-        previous = npc.current_location
-        npc.current_location = location_id
+        previous = self._change_npc_location(
+            actor_id=actor_id,
+            location_id=location_id,
+            movement_reason="validated_action",
+        )
         npc.current_action = "move"
         npc.current_goal = f"move_to_{location_id}"
         self._npc_schedule_locks[actor_id] = self.world_minute + 30
-        self._pending_actor_movements.append(
-            {
-                "actor_id": actor_id,
-                "from_location": previous,
-                "to_location": location_id,
-                "duration_seconds": 4.0,
-                "display_text": f"{npc.name} is heading to the {self.locations[location_id].name}.",
-            }
-        )
         self._append_event(
             event_type="npc_moved",
             actor_id=actor_id,
@@ -1417,11 +1530,12 @@ class WorldSimulation:
             grouped.setdefault(memory.owner_id, []).append(memory.to_dict())
         return grouped
 
-    def _claim_payload(self, claim_id: str) -> dict[str, Any]:
-        claims = {
+    def _claim_definitions(self) -> dict[str, dict[str, Any]]:
+        return {
             "tomo_took_seeds": {
                 "topic": "missing_seeds",
                 "summary": "Player says Tomo may have taken the public seed bag.",
+                "relayed_summary": "Player relayed Ivo's claim that Tomo may have taken the public seed bag.",
                 "claim_target_id": "tomo",
                 "truth_state": "unverified",
                 "importance": 0.75,
@@ -1444,7 +1558,52 @@ class WorldSimulation:
                 "emotional_valence": -0.1,
             },
         }
-        return claims.get(claim_id, claims["tomo_took_seeds"])
+
+    def _claim_payload(self, claim_id: str) -> dict[str, Any]:
+        return self._claim_definitions()[claim_id]
+
+    def _apply_player_claim_effect(
+        self,
+        target_id: str,
+        claim_id: str,
+        source_actor_id: str | None = None,
+        source_note_id: str | None = None,
+    ) -> list[str]:
+        claim = self._claim_payload(claim_id)
+        summary = claim["summary"]
+        if source_actor_id == "ivo":
+            summary = claim.get("relayed_summary", summary)
+        event_payload = {
+            "claim_id": claim_id,
+            "topic": claim["topic"],
+            "claim": summary,
+            "claim_target_id": claim.get("claim_target_id"),
+            "truth_state": claim["truth_state"],
+        }
+        if source_actor_id is not None:
+            event_payload["source_actor_id"] = source_actor_id
+        if source_note_id is not None:
+            event_payload["source_note_id"] = source_note_id
+        event_id = self._append_event(
+            event_type="memory_shared",
+            actor_id=self.player.player_id,
+            target_id=target_id,
+            payload=event_payload,
+        )
+        memory = self._write_memory(
+            owner_id=target_id,
+            memory_type="episodic",
+            topic=claim["topic"],
+            summary=summary,
+            source_event_log_id=event_id,
+            truth_state=claim["truth_state"],
+            target_id=claim.get("claim_target_id"),
+            importance=claim["importance"],
+            emotional_valence=claim["emotional_valence"],
+        )
+        changed_actor_ids = [target_id]
+        changed_actor_ids.extend(self._agent_planner_after_memory(memory))
+        return sorted(set(changed_actor_ids))
 
     def _dialogue_line(self, target_id: str, topic: str) -> str:
         if topic != "missing_seeds":
@@ -1502,47 +1661,147 @@ class WorldSimulation:
             }
         return {"accepted": True, "rejection_code": None, "display_text": ""}
 
-    def _dialogue_payload(self, npc_id: str) -> dict[str, Any]:
+    def _dialogue_payload(self, conversation: ConversationSession) -> dict[str, Any]:
+        npc_id = conversation.npc_id
         dialogues = {
             "mira": {
                 "line": "Good to see you. I am checking the workshop list before the afternoon.",
-                "choices": [
-                    ("greet", "Greet"),
-                    ("ask_about_work", "Ask About Work"),
-                    ("ask_about_village", "Ask About Village"),
-                    ("goodbye", "Goodbye"),
-                ],
             },
             "tomo": {
                 "line": "Morning. I am keeping an eye on the fields while the weather holds.",
-                "choices": [
-                    ("greet", "Greet"),
-                    ("ask_about_work", "Ask About Work"),
-                    ("ask_about_village", "Ask About Village"),
-                    ("goodbye", "Goodbye"),
-                ],
             },
             "ivo": {
                 "line": "Welcome in. If you need a warm meal or a local story, you came to the right place.",
-                "choices": [
-                    ("greet", "Greet"),
-                    ("ask_about_work", "Ask About Work"),
-                    ("ask_about_village", "Ask About Village"),
-                    ("goodbye", "Goodbye"),
-                ],
             },
         }
         dialogue = dialogues[npc_id]
+        choices = self._dialogue_choices(npc_id)
+        conversation.offered_choice_ids = [choice["choice_id"] for choice in choices]
         return {
             "type": "dialogue_opened",
+            "conversation_id": conversation.conversation_id,
+            "offer_version": conversation.offer_version,
             "npc_id": npc_id,
             "speaker": self.npcs[npc_id].name,
             "line": dialogue["line"],
-            "choices": [
-                {"choice_id": choice_id, "text": text}
-                for choice_id, text in dialogue["choices"]
-            ],
+            "choices": choices,
         }
+
+    def _dialogue_choices(self, npc_id: str) -> list[dict[str, str]]:
+        choices = [
+            {"choice_id": "greet", "text": "Greet"},
+            {"choice_id": "ask_about_work", "text": "Ask About Work"},
+            {"choice_id": "ask_about_village", "text": "Ask About Village"},
+        ]
+        if (
+            npc_id == "ivo"
+            and self._missing_seeds_accepts_claims()
+            and not self._player_has_claim_note("tomo_took_seeds")
+        ):
+            choices.append(
+                {
+                    "choice_id": "ask_about_missing_seeds",
+                    "text": "Ask About the Missing Seeds",
+                }
+            )
+        if (
+            npc_id == "mira"
+            and self._missing_seeds_accepts_claims()
+            and self._player_has_claim_note("tomo_took_seeds")
+            and not self._npc_has_received_claim("mira", "tomo_took_seeds")
+        ):
+            choices.append(
+                {
+                    "choice_id": "share_ivo_claim",
+                    "text": "Share Ivo's Claim About Tomo",
+                }
+            )
+        choices.append({"choice_id": "goodbye", "text": "Goodbye"})
+        return choices
+
+    def _open_conversation(
+        self,
+        client_session_id: str,
+        npc_id: str,
+    ) -> ConversationSession:
+        existing_id = self._open_conversation_by_client.get(client_session_id)
+        if existing_id is not None:
+            existing = self.conversations.get(existing_id)
+            if existing is not None:
+                self._close_conversation(existing, "superseded")
+
+        self._conversation_counter += 1
+        conversation = ConversationSession(
+            conversation_id=f"conv_{self._conversation_counter:06d}",
+            client_session_id=client_session_id,
+            npc_id=npc_id,
+            status="open",
+            offer_version=1,
+            offered_choice_ids=[],
+        )
+        self.conversations[conversation.conversation_id] = conversation
+        self._open_conversation_by_client[client_session_id] = conversation.conversation_id
+        return conversation
+
+    def _close_conversation(
+        self,
+        conversation: ConversationSession,
+        reason: str,
+    ) -> None:
+        if conversation.status != "open":
+            return
+        conversation.status = "closed"
+        conversation.close_reason = reason
+        if self._open_conversation_by_client.get(conversation.client_session_id) == conversation.conversation_id:
+            del self._open_conversation_by_client[conversation.client_session_id]
+        self._closed_conversation_ids.append(conversation.conversation_id)
+        self._prune_closed_conversations()
+
+    def _close_conversations_for_actor(self, actor_id: str, reason: str) -> None:
+        for conversation in list(self.conversations.values()):
+            if conversation.status != "open":
+                continue
+            if actor_id == self.player.player_id or conversation.npc_id == actor_id:
+                self._close_conversation(conversation, reason)
+
+    def _close_conversations_offering(
+        self,
+        choice_id: str,
+        reason: str,
+        *,
+        exclude_conversation_id: str | None = None,
+    ) -> None:
+        for conversation in list(self.conversations.values()):
+            if conversation.status != "open":
+                continue
+            if conversation.conversation_id == exclude_conversation_id:
+                continue
+            if choice_id in conversation.offered_choice_ids:
+                self._close_conversation(conversation, reason)
+
+    def _prune_closed_conversations(self) -> None:
+        while len(self._closed_conversation_ids) > MAX_CLOSED_CONVERSATIONS:
+            conversation_id = self._closed_conversation_ids.pop(0)
+            self.conversations.pop(conversation_id, None)
+
+    def _dialogue_rejection(
+        self,
+        code: str,
+        display_text: str,
+        *,
+        conversation_id: str,
+        offer_version: int | None = None,
+    ) -> dict[str, Any]:
+        response: dict[str, Any] = {
+            "type": "dialogue_rejected",
+            "reason": code,
+            "code": code,
+            "conversation_id": conversation_id,
+            "display_text": display_text,
+        }
+        if offer_version is not None:
+            response["offer_version"] = offer_version
+        return response
 
     def _dialogue_choice_response(self, npc_id: str, choice_id: str) -> str:
         responses = {
@@ -1550,6 +1809,7 @@ class WorldSimulation:
                 "greet": "Mira gives a small nod and relaxes her shoulders.",
                 "ask_about_work": "Mira says the workshop is quiet, which is exactly how she likes it.",
                 "ask_about_village": "Mira says the village works best when everyone keeps their promises.",
+                "share_ivo_claim": "Mira listens carefully and decides to ask Tomo herself.",
                 "goodbye": "You step back from Mira's workbench.",
             },
             "tomo": {
@@ -1562,6 +1822,7 @@ class WorldSimulation:
                 "greet": "Ivo welcomes you like an old regular.",
                 "ask_about_work": "Ivo says the tavern runs on warm food and careful listening.",
                 "ask_about_village": "Ivo says every village story changes a little by sunset.",
+                "ask_about_missing_seeds": "Ivo lowers his voice and shares what he heard about Tomo.",
                 "goodbye": "You leave Ivo to tend the tavern.",
             },
         }
@@ -1574,20 +1835,44 @@ class WorldSimulation:
         title: str,
         text: str,
         source_event_log_id: str,
+        claim_id: str | None = None,
+        source_actor_id: str | None = None,
     ) -> None:
-        if not any(note["note_id"] == note_id for note in self.player.notes):
-            self.player.notes.append({"note_id": note_id, "title": title, "text": text})
+        note: dict[str, Any] = {
+            "note_id": note_id,
+            "title": title,
+            "text": text,
+        }
+        if claim_id is not None:
+            note["claim_id"] = claim_id
+        if source_actor_id is not None:
+            note["source_actor_id"] = source_actor_id
+        if not any(existing["note_id"] == note_id for existing in self.player.notes):
+            self.player.notes.append(note)
         self._append_event(
             event_type="player_note_added",
             actor_id=self.player.player_id,
             target_id=None,
             payload={
-                "note_id": note_id,
-                "title": title,
-                "text": text,
+                **note,
                 "source_event_log_id": source_event_log_id,
             },
         )
+
+    def _player_has_claim_note(self, claim_id: str) -> bool:
+        return any(note.get("claim_id") == claim_id for note in self.player.notes)
+
+    def _npc_has_received_claim(self, npc_id: str, claim_id: str) -> bool:
+        return any(
+            event.type == "memory_shared"
+            and event.target_id == npc_id
+            and event.payload.get("claim_id") == claim_id
+            for event in self._event_log
+        )
+
+    def _missing_seeds_accepts_claims(self) -> bool:
+        phase = str(self.world_events["evt_missing_seeds"]["phase"])
+        return not phase.startswith("resolved_")
 
     def _player_has_evidence(self, evidence_id: str) -> bool:
         normalized = evidence_id.replace("fact_", "")
@@ -1618,6 +1903,30 @@ class WorldSimulation:
             else:
                 break
         return current
+
+    def _change_npc_location(
+        self,
+        actor_id: str,
+        location_id: str,
+        movement_reason: str,
+    ) -> str:
+        npc = self.npcs[actor_id]
+        previous = npc.current_location
+        if previous == location_id:
+            return previous
+        npc.current_location = location_id
+        self._pending_actor_movements.append(
+            {
+                "actor_id": actor_id,
+                "from_location": previous,
+                "to_location": location_id,
+                "duration_seconds": 4.0,
+                "display_text": f"{npc.name} is heading to the {self.locations[location_id].name}.",
+                "reason": movement_reason,
+            }
+        )
+        self._close_conversations_for_actor(actor_id, "npc_moved")
+        return previous
 
     def _location_occupants(self) -> dict[str, list[str]]:
         occupants: dict[str, list[str]] = {location_id: [] for location_id in self.locations}

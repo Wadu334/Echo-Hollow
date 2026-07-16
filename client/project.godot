@@ -9,6 +9,10 @@ config/name="Echo Hollow MVP"
 run/main_scene="res://scenes/main.tscn"
 config/features=PackedStringArray("4.3")
 
+[autoload]
+
+WorldConnection="*res://scripts/world_connection.gd"
+
 [display]
 
 window/size/viewport_width=960

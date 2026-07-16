@@ -16,6 +16,14 @@ class CapturingHub(WorldHub):
         self.messages.append(message)
 
 
+class FakeWebSocket:
+    def __init__(self) -> None:
+        self.messages: list[dict] = []
+
+    async def send_json(self, message: dict) -> None:
+        self.messages.append(message)
+
+
 class PlayableWorldBackendTests(unittest.TestCase):
     def test_player_entered_location_updates_player_current_location(self) -> None:
         world = WorldSimulation()
@@ -41,6 +49,8 @@ class PlayableWorldBackendTests(unittest.TestCase):
         response = world.player_interact_npc("mira", "talk")
 
         self.assertEqual(response["type"], "dialogue_opened")
+        self.assertEqual(response["offer_version"], 1)
+        self.assertTrue(response["conversation_id"].startswith("conv_"))
         self.assertEqual(response["npc_id"], "mira")
         self.assertEqual(response["speaker"], "Mira")
         self.assertIn("workshop", response["line"])
@@ -52,10 +62,17 @@ class PlayableWorldBackendTests(unittest.TestCase):
     def test_normal_dialogue_choice_returns_player_facing_feedback(self) -> None:
         world = WorldSimulation()
         world.move_player("workshop")
+        opened = world.player_interact_npc("mira", "talk")
 
-        response = world.dialogue_choice("mira", "ask_about_work")
+        response = world.dialogue_choice(
+            opened["conversation_id"],
+            opened["offer_version"],
+            "ask_about_work",
+        )
 
         self.assertEqual(response["type"], "dialogue_result")
+        self.assertEqual(response["offer_version"], 2)
+        self.assertFalse(response["conversation_closed"])
         self.assertEqual(response["toast"], "Mira says the workshop is quiet, which is exactly how she likes it.")
         self.assertEqual(response["display_text"], response["toast"])
         self.assertEqual(response["world_diff"]["reason"], "dialogue_choice")
@@ -68,10 +85,11 @@ class PlayableWorldBackendTests(unittest.TestCase):
             world.move_player(location_id)
             response = world.player_interact_npc(npc_id, "talk")
             choice_ids = {choice["choice_id"] for choice in response["choices"]}
-            self.assertEqual(
-                choice_ids,
-                {"greet", "ask_about_work", "ask_about_village", "goodbye"},
+            self.assertTrue(
+                {"greet", "ask_about_work", "ask_about_village", "goodbye"}.issubset(choice_ids),
             )
+            if npc_id == "ivo":
+                self.assertIn("ask_about_missing_seeds", choice_ids)
 
     def test_actor_movement_diff_appears_when_npc_move_to_executes(self) -> None:
         world = WorldSimulation()
@@ -133,6 +151,7 @@ class PlayableWorldBackendTests(unittest.TestCase):
         world = WorldSimulation()
         world.move_player("workshop")
         hub = CapturingHub(world)
+        websocket = FakeWebSocket()
 
         response = asyncio.run(
             hub.handle_message(
@@ -140,31 +159,50 @@ class PlayableWorldBackendTests(unittest.TestCase):
                     "type": "player_interact_npc",
                     "npc_id": "mira",
                     "interaction": "talk",
-                }
+                },
+                websocket=websocket,
+                client_session_id="session_a",
             )
         )
 
         self.assertEqual(response["type"], "dialogue_opened")
-        self.assertEqual(hub.messages[-1]["type"], "dialogue_opened")
+        self.assertEqual(websocket.messages[-1]["type"], "dialogue_opened")
+        self.assertEqual(hub.messages, [])
 
     def test_websocket_handler_broadcasts_dialogue_choice_world_diff(self) -> None:
         world = WorldSimulation()
         world.move_player("square")
         hub = CapturingHub(world)
+        websocket = FakeWebSocket()
+        opened = asyncio.run(
+            hub.handle_message(
+                {
+                    "type": "player_interact_npc",
+                    "npc_id": "ivo",
+                    "interaction": "talk",
+                },
+                websocket=websocket,
+                client_session_id="session_a",
+            )
+        )
+        websocket.messages.clear()
 
         response = asyncio.run(
             hub.handle_message(
                 {
                     "type": "dialogue_choice",
-                    "npc_id": "ivo",
+                    "conversation_id": opened["conversation_id"],
+                    "offer_version": opened["offer_version"],
                     "choice_id": "ask_about_village",
-                }
+                },
+                websocket=websocket,
+                client_session_id="session_a",
             )
         )
 
         self.assertEqual(response["type"], "dialogue_result")
-        self.assertEqual(hub.messages[0]["type"], "dialogue_result")
-        self.assertEqual(hub.messages[1]["type"], "world_diff")
+        self.assertEqual(websocket.messages[0]["type"], "dialogue_result")
+        self.assertEqual(hub.messages[0]["type"], "world_diff")
 
 
 if __name__ == "__main__":

@@ -21,10 +21,14 @@ class GodotProjectFileTests(unittest.TestCase):
         self.assertIn('path="res://scripts/main.gd"', scene)
         self.assertIn('[node name="Main" type="Node2D"]', scene)
 
-    def test_main_script_uses_expected_world_socket_and_location_keys(self) -> None:
+    def test_client_uses_persistent_world_socket_and_expected_location_keys(self) -> None:
         script = (CLIENT / "scripts" / "main.gd").read_text(encoding="utf-8")
+        connection_script = (CLIENT / "scripts" / "world_connection.gd").read_text(encoding="utf-8")
+        project = (CLIENT / "project.godot").read_text(encoding="utf-8")
 
-        self.assertIn('ws://127.0.0.1:8000/ws/world/demo_world_001', script)
+        self.assertIn('ws://127.0.0.1:8000/ws/world/demo_world_001', connection_script)
+        self.assertIn('OS.get_environment("ECHO_HOLLOW_SERVER_URL")', connection_script)
+        self.assertIn('WorldConnection="*res://scripts/world_connection.gd"', project)
         for key in ["KEY_1", "KEY_2", "KEY_3", "KEY_4", "KEY_5"]:
             self.assertIn(key, script)
         for location_id in ["square", "tavern", "farm", "workshop", "warehouse"]:
