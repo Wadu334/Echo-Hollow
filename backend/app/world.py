@@ -6,6 +6,15 @@ from typing import Any
 from .agent_runtime import AgentRuntimeV1
 from .director import VillageDirector
 from .episode import MissingSeedsEpisodeManager
+from .missing_seeds import (
+    CAREFUL_CONFRONTATION,
+    MISSING_SEEDS_EVENT_ID,
+    MISSING_SEEDS_RUMOR_ID,
+    RECONCILIATION_RECIPIENT_ID,
+    TOMO_CLAIM_ID,
+    TORN_SEED_BAG_EVIDENCE_ID,
+    TORN_SEED_BAG_FACT_ID,
+)
 
 
 def format_world_time(day: int, minute_of_day: int) -> str:
@@ -77,12 +86,14 @@ class PlayerState:
     player_id: str = "player"
     current_location: str = "square"
     notes: list[dict[str, Any]] = field(default_factory=list)
+    evidence: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "player_id": self.player_id,
             "current_location": self.current_location,
             "notes": self.notes,
+            "evidence": self.evidence,
         }
 
 
@@ -275,6 +286,7 @@ class WorldSimulation:
         self.agent_runtime = AgentRuntimeV1()
         self.director = VillageDirector()
         self.episode_manager = MissingSeedsEpisodeManager()
+        self.missing_seeds = self.episode_manager.rules
         self._event_counter = 0
         self._memory_counter = 0
         self._action_counter = 0
@@ -282,12 +294,14 @@ class WorldSimulation:
         self._event_log: list[EventLogEntry] = []
         self._pending_actor_movements: list[dict[str, Any]] = []
         self.conversations: dict[str, ConversationSession] = {}
+        self.pending_presentations: dict[str, dict[str, Any]] = {}
         self._open_conversation_by_client: dict[str, str] = {}
         self._closed_conversation_ids: list[str] = []
         self.last_validator_result: dict[str, Any] | None = None
         self.last_agent_trace: dict[str, Any] | None = None
         self.last_director_trace: dict[str, Any] | None = None
         self.last_relationship_change: dict[str, Any] | None = None
+        self.missing_seeds.event(self)
         self._append_event(
             event_type="world_started",
             actor_id=None,
@@ -671,7 +685,7 @@ class WorldSimulation:
         )
         toast = self._dialogue_choice_response(npc_id, choice_id)
         changed_actor_ids = [self.player.player_id, npc_id]
-        conversation_closed = choice_id in {"goodbye", "share_ivo_claim"}
+        conversation_closed = choice_id in {"goodbye", "share_ivo_claim", "show_torn_seed_bag"}
 
         if npc_id == "ivo" and choice_id == "ask_about_missing_seeds":
             self._add_player_note(
@@ -703,6 +717,20 @@ class WorldSimulation:
                 exclude_conversation_id=conversation_id,
             )
             toast = "Mira remembers Ivo's claim and decides to ask Tomo herself."
+        elif npc_id == "mira" and choice_id == "show_torn_seed_bag":
+            changed_actor_ids.extend(
+                self._apply_player_evidence_share(
+                    target_id=RECONCILIATION_RECIPIENT_ID,
+                    evidence_id=TORN_SEED_BAG_EVIDENCE_ID,
+                    source="dialogue_choice",
+                )
+            )
+            self._close_conversations_offering(
+                "show_torn_seed_bag",
+                "offer_invalidated",
+                exclude_conversation_id=conversation_id,
+            )
+            toast = "Mira studies the torn bag, corrects the rumor, and goes to make things right."
 
         next_choices: list[dict[str, str]] = []
         if conversation_closed:
@@ -735,6 +763,19 @@ class WorldSimulation:
 
     def investigate_location(self, location_id: str) -> dict[str, Any]:
         return self.investigate(location_id)
+
+    def activate_contextual_action(self, action_id: str, offer_version: int) -> dict[str, Any]:
+        rejection_code = self.missing_seeds.validate_contextual_action(
+            self,
+            action_id=action_id,
+            offer_version=offer_version,
+        )
+        if rejection_code is not None:
+            return self._rejection(
+                rejection_code,
+                {"action_id": action_id, "offer_version": offer_version},
+            )
+        return self._discover_torn_seed_bag(provenance_kind="contextual_action")
 
     def observe(self) -> dict[str, Any]:
         event_id = self._append_event(
@@ -788,6 +829,13 @@ class WorldSimulation:
     def share_claim(self, target_id: str, claim_id: str) -> dict[str, Any]:
         if claim_id not in self._claim_definitions():
             return self._rejection("claim_not_found", {"claim_id": claim_id})
+        if self.missing_seeds.is_terminal(self):
+            return self._rejection("episode_terminal", {"claim_id": claim_id})
+        if self._npc_has_received_claim(target_id, claim_id):
+            return self._rejection(
+                "duplicate_information",
+                {"claim_id": claim_id, "target_id": target_id},
+            )
 
         claim = self._claim_payload(claim_id)
         validation = self._validate_tool(
@@ -835,6 +883,9 @@ class WorldSimulation:
         return self._diff(reason="rumor_spread", changed_actor_ids=[actor_id, target_id], latest_events_count=4)
 
     def investigate(self, subject_id: str) -> dict[str, Any]:
+        semantic_rejection = self.missing_seeds.validate_investigation(self, subject_id)
+        if semantic_rejection is not None:
+            return self._rejection(semantic_rejection, {"location_id": subject_id})
         validation = self._validate_tool(
             tool_name="investigate",
             actor_id=self.player.player_id,
@@ -843,30 +894,7 @@ class WorldSimulation:
         )
         if not validation["accepted"]:
             return self._tool_rejection(validation)
-
-        self._mark_torn_seed_evidence_public()
-        self.episode_manager.set_phase(self, "evidence_found")
-        event_id = self._append_event(
-            event_type="evidence_found",
-            actor_id=self.player.player_id,
-            target_id=subject_id,
-            payload={
-                "evidence_id": "torn_seed_bag",
-                "fact_id": "fact_torn_seed_bag",
-                "content": "The seed bag was torn open near the warehouse.",
-                "event_phase": self.world_events["evt_missing_seeds"]["phase"],
-            },
-        )
-        self._write_memory(
-            owner_id=self.player.player_id,
-            memory_type="evidence",
-            topic="missing_seeds",
-            summary="Player found a torn seed bag near the warehouse.",
-            source_event_log_id=event_id,
-            truth_state="verified",
-            importance=0.9,
-        )
-        return self._diff(reason="evidence_found", changed_actor_ids=["player"], latest_events_count=4)
+        return self._discover_torn_seed_bag(provenance_kind="debug_investigate")
 
     def player_share_evidence(self, target_id: str, evidence_id: str = "torn_seed_bag") -> dict[str, Any]:
         validation = self._validate_tool(
@@ -878,29 +906,11 @@ class WorldSimulation:
         )
         if not validation["accepted"]:
             return self._tool_rejection(validation)
-
-        self.episode_manager.set_phase(self, "resolution_pending")
-        event_id = self._append_event(
-            event_type="evidence_shared",
-            actor_id=self.player.player_id,
+        self._apply_player_evidence_share(
             target_id=target_id,
-            payload={
-                "evidence_id": evidence_id,
-                "summary": "Player showed Mira the torn seed bag evidence.",
-            },
+            evidence_id=evidence_id,
+            source="debug_adapter",
         )
-        self._write_memory(
-            owner_id=target_id,
-            memory_type="evidence",
-            topic="missing_seeds",
-            summary="Player showed evidence that the seed bag was torn near the warehouse.",
-            source_event_log_id=event_id,
-            truth_state="verified",
-            target_id=None,
-            importance=0.95,
-            emotional_valence=0.15,
-        )
-        self.episode_manager.resolve_event(self, "reconciled")
         return self._diff(reason="evidence_shared", changed_actor_ids=[target_id, "player"], latest_events_count=12)
 
     def resolve_event(self, event_id: str, path: str) -> dict[str, Any]:
@@ -981,6 +991,7 @@ class WorldSimulation:
             "last_director_trace": self.last_director_trace,
             "director_state": self.director.to_dict(),
             "last_relationship_change": self.last_relationship_change,
+            "pending_presentations": list(self.pending_presentations.values()),
             "presentation": self._presentation(),
             "latest_events": self.events(limit=8),
         }
@@ -992,6 +1003,14 @@ class WorldSimulation:
     def events(self, limit: int = 50) -> list[dict[str, Any]]:
         bounded_limit = max(1, min(limit, 200))
         return [entry.to_dict() for entry in self._event_log[-bounded_limit:]]
+
+    def events_after(self, cursor: int, limit: int = 500) -> list[dict[str, Any]]:
+        bounded_cursor = max(0, min(int(cursor), self._event_counter))
+        bounded_limit = max(1, min(int(limit), 1000))
+        return [
+            entry.to_dict()
+            for entry in self._event_log[bounded_cursor : bounded_cursor + bounded_limit]
+        ]
 
     def enqueue_action(
         self,
@@ -1028,6 +1047,7 @@ class WorldSimulation:
             target_id=action_id,
             payload=action.to_dict(),
         )
+        self.episode_manager.on_action_queued(self, action)
         return action_id
 
     def has_pending_action(self, actor_id: str, tool_name: str, args: dict[str, Any]) -> bool:
@@ -1096,7 +1116,14 @@ class WorldSimulation:
         if action.tool_name == "npc_move_to":
             return self._execute_npc_move_to(str(args["actor_id"]), str(args["location_id"]))
         if action.tool_name == "npc_talk_to":
-            return self._execute_npc_talk_to(str(args["actor_id"]), str(args["target_id"]), str(args["topic"]))
+            return self._execute_npc_talk_to(
+                str(args["actor_id"]),
+                str(args["target_id"]),
+                str(args["topic"]),
+                episode_id=args.get("episode_id"),
+                social_act=args.get("social_act"),
+                causal_claim_id=args.get("causal_claim_id"),
+            )
         if action.tool_name == "npc_share_memory":
             return self._execute_npc_share_memory(str(args["actor_id"]), str(args["target_id"]), str(args["memory_id"]))
         if action.tool_name == "npc_gossip":
@@ -1126,15 +1153,35 @@ class WorldSimulation:
         )
         return [actor_id]
 
-    def _execute_npc_talk_to(self, actor_id: str, target_id: str, topic: str) -> list[str]:
+    def _execute_npc_talk_to(
+        self,
+        actor_id: str,
+        target_id: str,
+        topic: str,
+        *,
+        episode_id: str | None,
+        social_act: str | None,
+        causal_claim_id: str | None,
+    ) -> list[str]:
         line = self.agent_runtime.provider.generate_dialogue(
-            {"speaker_id": actor_id, "target_id": target_id, "topic": topic}
+            {
+                "speaker_id": actor_id,
+                "target_id": target_id,
+                "topic": topic,
+                "social_act": social_act,
+            }
         ).line
         event_id = self._append_event(
             event_type="npc_dialogue_started",
             actor_id=actor_id,
             target_id=target_id,
-            payload={"topic": topic, "line": line},
+            payload={
+                "topic": topic,
+                "line": line,
+                "episode_id": episode_id,
+                "social_act": social_act,
+                "causal_claim_id": causal_claim_id,
+            },
         )
         self._npc_schedule_locks[actor_id] = self.world_minute + 20
         self._npc_schedule_locks[target_id] = self.world_minute + 20
@@ -1142,7 +1189,7 @@ class WorldSimulation:
             owner_id=actor_id,
             memory_type="episodic",
             topic=topic,
-            summary=f"{self.npcs[actor_id].name} questioned {self.npcs[target_id].name} about {topic}.",
+            summary=f"{self.npcs[actor_id].name} carefully asked {self.npcs[target_id].name} about {topic}.",
             source_event_log_id=event_id,
             truth_state="verified",
             target_id=target_id,
@@ -1153,20 +1200,28 @@ class WorldSimulation:
             owner_id=target_id,
             memory_type="episodic",
             topic=topic,
-            summary=f"{self.npcs[actor_id].name} questioned {self.npcs[target_id].name} about {topic}.",
+            summary=f"{self.npcs[actor_id].name} carefully asked {self.npcs[target_id].name} about {topic}.",
             source_event_log_id=event_id,
             truth_state="verified",
             target_id=actor_id,
             importance=0.62,
             emotional_valence=-0.28,
         )
-        if actor_id == "mira" and target_id == "tomo" and topic == "missing_seeds":
+        if (
+            actor_id == "mira"
+            and target_id == "tomo"
+            and topic == "missing_seeds"
+            and episode_id == MISSING_SEEDS_EVENT_ID
+            and social_act == CAREFUL_CONFRONTATION
+            and causal_claim_id == TOMO_CLAIM_ID
+        ):
             if "suspicious_of_tomo" not in self.npcs["mira"].status_flags:
                 self.npcs["mira"].status_flags.append("suspicious_of_tomo")
             self.npcs["mira"].mood = "stern"
             self.npcs["tomo"].mood = "hurt"
             self._change_relationship("tomo", "mira", {"trust": -0.08, "affinity": -0.04}, event_id)
-            self._spread_rumor_state("mira", "tomo", "rumor_tomo_took_seeds")
+            self._spread_rumor_state("mira", "tomo", MISSING_SEEDS_RUMOR_ID)
+            self._publish_confrontation_presentation(event_id=event_id, line=line)
         return [actor_id, target_id]
 
     def _execute_npc_share_memory(self, actor_id: str, target_id: str, memory_id: str) -> list[str]:
@@ -1234,6 +1289,19 @@ class WorldSimulation:
         return [actor_id]
 
     def _validate_action(self, action: QueuedAction) -> dict[str, Any]:
+        semantic_rejection = self.missing_seeds.validate_queued_action(self, action)
+        if semantic_rejection is not None:
+            result = {
+                "tool_name": action.tool_name,
+                "actor_id": action.actor_id,
+                "target_id": action.args.get("target_id"),
+                "topic": action.args.get("topic", "missing_seeds"),
+                "accepted": False,
+                "rejection_code": semantic_rejection,
+                "debug_reason": "Missing Seeds semantic precondition failed at execution time.",
+            }
+            self.last_validator_result = result
+            return result
         return self._validate_tool(
             tool_name=action.tool_name,
             actor_id=str(action.args.get("actor_id", action.actor_id)),
@@ -1351,6 +1419,9 @@ class WorldSimulation:
             elif rumor_id is None or rumor_id not in self.rumors:
                 result["rejection_code"] = "rumor_not_found"
                 result["debug_reason"] = "Rumor must exist before it can spread."
+            elif self.rumors[str(rumor_id)].verified_state == "false":
+                result["rejection_code"] = "rumor_debunked"
+                result["debug_reason"] = "A debunked rumor cannot spread further."
             elif actor_id not in self.rumors[str(rumor_id)].current_holder_ids:
                 result["rejection_code"] = "memory_not_owned"
                 result["debug_reason"] = "Actor does not hold this rumor."
@@ -1374,7 +1445,15 @@ class WorldSimulation:
                 result["accepted"] = True
                 result["debug_reason"] = "Validator accepted NPC investigation."
         elif tool_name == "player_share_evidence":
-            if target_id not in self.npcs:
+            semantic_rejection = self.missing_seeds.validate_evidence_share(
+                self,
+                target_id=target_id,
+                evidence_id=str(evidence_id or TORN_SEED_BAG_EVIDENCE_ID),
+            )
+            if semantic_rejection is not None:
+                result["rejection_code"] = semantic_rejection
+                result["debug_reason"] = "Evidence share failed a Missing Seeds semantic precondition."
+            elif target_id not in self.npcs:
                 result["rejection_code"] = "target_not_found"
                 result["debug_reason"] = f"Unknown NPC target {target_id}."
             elif self.player.current_location != self._actor_location(str(target_id)):
@@ -1412,6 +1491,8 @@ class WorldSimulation:
 
         changed_actor_ids: list[str] = [memory.owner_id]
         self.episode_manager.on_claim_memory(self, memory)
+        if self.missing_seeds.is_terminal(self):
+            return changed_actor_ids
 
         if memory.owner_id == "mira" and memory.topic == "missing_seeds" and memory.target_id == "tomo":
             cautious = self._mira_has_reflection_modifier()
@@ -1425,11 +1506,12 @@ class WorldSimulation:
             if flag not in npc.status_flags:
                 npc.status_flags.append(flag)
             rumor = self.rumors["rumor_tomo_took_seeds"]
-            if "mira" not in rumor.current_holder_ids:
+            if rumor.verified_state != "false" and "mira" not in rumor.current_holder_ids:
                 rumor.current_holder_ids.append("mira")
                 rumor.source_chain.append("player")
                 rumor.spread_count += 1
-            rumor.confidence = _clamp(max(rumor.confidence, 0.38 if cautious else 0.46))
+            if rumor.verified_state != "false":
+                rumor.confidence = _clamp(max(rumor.confidence, 0.38 if cautious else 0.46))
             self._write_memory(
                 owner_id="mira",
                 memory_type="rumor",
@@ -1616,6 +1698,8 @@ class WorldSimulation:
 
     def _spread_rumor_state(self, actor_id: str, target_id: str, rumor_id: str) -> RumorState:
         rumor = self.rumors[rumor_id]
+        if rumor.verified_state == "false":
+            return rumor
         if actor_id not in rumor.current_holder_ids:
             rumor.current_holder_ids.append(actor_id)
         if target_id not in rumor.current_holder_ids:
@@ -1633,6 +1717,143 @@ class WorldSimulation:
             if fact["fact_id"] == "fact_torn_seed_bag":
                 fact["verified"] = True
                 fact["public"] = True
+
+    def _discover_torn_seed_bag(self, provenance_kind: str) -> dict[str, Any]:
+        if not self.episode_manager.set_phase(self, "evidence_found"):
+            return self._rejection(
+                "semantic_precondition_failed",
+                {"evidence_id": TORN_SEED_BAG_EVIDENCE_ID},
+            )
+        self._mark_torn_seed_evidence_public()
+        event_id = self._append_event(
+            event_type="evidence_found",
+            actor_id=self.player.player_id,
+            target_id="warehouse",
+            payload={
+                "evidence_id": TORN_SEED_BAG_EVIDENCE_ID,
+                "fact_id": TORN_SEED_BAG_FACT_ID,
+                "found_location": "warehouse",
+                "content": "The seed bag was torn open near the warehouse.",
+                "provenance": {
+                    "kind": provenance_kind,
+                    "actor_id": self.player.player_id,
+                    "clue_id": "clue_torn_seed_bag",
+                    "location_id": "warehouse",
+                },
+                "event_phase": self.world_events[MISSING_SEEDS_EVENT_ID]["phase"],
+            },
+        )
+        record = self.missing_seeds.record_evidence_found(
+            self,
+            event_log_id=event_id,
+            provenance_kind=provenance_kind,
+        )
+        if record is None:
+            return self._rejection(
+                "evidence_already_found",
+                {"evidence_id": TORN_SEED_BAG_EVIDENCE_ID},
+            )
+        self._event_log[-1].payload["evidence"] = record
+        self.player.evidence.append(dict(record))
+        self._write_memory(
+            owner_id=self.player.player_id,
+            memory_type="evidence",
+            topic="missing_seeds",
+            summary="Player found a torn seed bag near the warehouse.",
+            source_event_log_id=event_id,
+            truth_state="verified",
+            importance=0.9,
+        )
+        return self._diff(
+            reason="evidence_found",
+            changed_actor_ids=["player"],
+            latest_events_count=5,
+            toasts=["You found the torn seed bag near the warehouse shelves."],
+        )
+
+    def _apply_player_evidence_share(
+        self,
+        *,
+        target_id: str,
+        evidence_id: str,
+        source: str,
+    ) -> list[str]:
+        event_id = self._append_event(
+            event_type="evidence_shared",
+            actor_id=self.player.player_id,
+            target_id=target_id,
+            payload={
+                "episode_id": MISSING_SEEDS_EVENT_ID,
+                "evidence_id": evidence_id,
+                "recipient_id": target_id,
+                "source": source,
+                "summary": "Player showed Mira the torn seed bag evidence.",
+            },
+        )
+        if not self.missing_seeds.record_evidence_shared(self, evidence_id, event_id):
+            return []
+        for record in self.player.evidence:
+            if record.get("evidence_id") == evidence_id:
+                record["status"] = "shared"
+                record["shared_event_log_id"] = event_id
+        self._write_memory(
+            owner_id=target_id,
+            memory_type="evidence",
+            topic="missing_seeds",
+            summary="Player showed evidence that the seed bag was torn near the warehouse.",
+            source_event_log_id=event_id,
+            truth_state="verified",
+            target_id=None,
+            importance=0.95,
+            emotional_valence=0.15,
+        )
+        self.episode_manager.set_phase(self, "resolution_pending")
+        self.episode_manager.resolve_event(self, "reconciled")
+        return [target_id, self.player.player_id]
+
+    def _publish_confrontation_presentation(self, *, event_id: str, line: str) -> None:
+        presentation_id = "presentation_evt_missing_seeds_careful_confrontation"
+        if presentation_id in self.pending_presentations:
+            return
+        presentation = {
+            "presentation_id": presentation_id,
+            "type": "rumor_consequence",
+            "title": "A Rumor Reaches Tomo",
+            "line": line,
+            "reaction_text": "Tomo is hurt by the suspicion, even though Mira asks for his side first.",
+            "relationship_trend_text": "Trust between Tomo and Mira has been strained.",
+            "reflection_text": "Mira chose to ask a careful question before treating the rumor as fact.",
+            "path": "careful_confrontation",
+            "event_log_id": event_id,
+        }
+        self.pending_presentations[presentation_id] = presentation
+        for entry in reversed(self._event_log):
+            if entry.event_log_id == event_id:
+                entry.payload["presentation"] = presentation
+                break
+        event = self.missing_seeds.event(self)
+        presentation_ids = event.setdefault("presentation_ids", [])
+        if presentation_id not in presentation_ids:
+            presentation_ids.append(presentation_id)
+
+    def ack_presentation(self, presentation_id: str) -> dict[str, Any]:
+        presentation = self.pending_presentations.pop(presentation_id, None)
+        if presentation is None:
+            return self._rejection(
+                "presentation_not_found",
+                {"presentation_id": presentation_id},
+            )
+        self._append_event(
+            event_type="presentation_acknowledged",
+            actor_id=self.player.player_id,
+            target_id=presentation_id,
+            payload={"presentation_id": presentation_id},
+        )
+        return self._diff(
+            reason="presentation_acknowledged",
+            changed_actor_ids=[],
+            latest_events_count=1,
+        )
 
     def _validate_player_interaction(self, npc_id: str, interaction: str) -> dict[str, Any]:
         if npc_id not in self.npcs:
@@ -1714,6 +1935,21 @@ class WorldSimulation:
                 {
                     "choice_id": "share_ivo_claim",
                     "text": "Share Ivo's Claim About Tomo",
+                }
+            )
+        if (
+            npc_id == RECONCILIATION_RECIPIENT_ID
+            and self.missing_seeds.validate_evidence_share(
+                self,
+                target_id=RECONCILIATION_RECIPIENT_ID,
+                evidence_id=TORN_SEED_BAG_EVIDENCE_ID,
+            )
+            is None
+        ):
+            choices.append(
+                {
+                    "choice_id": "show_torn_seed_bag",
+                    "text": "Show Mira the Torn Seed Bag",
                 }
             )
         choices.append({"choice_id": "goodbye", "text": "Goodbye"})
@@ -1810,6 +2046,7 @@ class WorldSimulation:
                 "ask_about_work": "Mira says the workshop is quiet, which is exactly how she likes it.",
                 "ask_about_village": "Mira says the village works best when everyone keeps their promises.",
                 "share_ivo_claim": "Mira listens carefully and decides to ask Tomo herself.",
+                "show_torn_seed_bag": "Mira studies the torn bag and realizes Tomo was blamed unfairly.",
                 "goodbye": "You step back from Mira's workbench.",
             },
             "tomo": {
@@ -1871,19 +2108,13 @@ class WorldSimulation:
         )
 
     def _missing_seeds_accepts_claims(self) -> bool:
-        phase = str(self.world_events["evt_missing_seeds"]["phase"])
-        return not phase.startswith("resolved_")
+        return not self.missing_seeds.is_terminal(self)
 
     def _player_has_evidence(self, evidence_id: str) -> bool:
         normalized = evidence_id.replace("fact_", "")
-        if normalized not in {"torn_seed_bag", "seed_bag"}:
-            return False
-        return any(
-            memory.owner_id == "player"
-            and memory.type == "evidence"
-            and "torn seed bag" in memory.summary.lower()
-            for memory in self.memories.values()
-        )
+        if normalized == "seed_bag":
+            normalized = TORN_SEED_BAG_EVIDENCE_ID
+        return self.missing_seeds.evidence_record(self, normalized) is not None
 
     def _mira_has_reflection_modifier(self) -> bool:
         modifiers = set(self.npcs["mira"].behavior_modifiers)
@@ -1967,6 +2198,7 @@ class WorldSimulation:
             "last_director_trace": snapshot["last_director_trace"],
             "director_state": snapshot["director_state"],
             "last_relationship_change": snapshot["last_relationship_change"],
+            "pending_presentations": snapshot["pending_presentations"],
             "actor_movements": actor_movements,
             "presentation": self._presentation(toasts=toasts),
             "latest_events": self.events(limit=latest_events_count),
@@ -2002,6 +2234,8 @@ class WorldSimulation:
             "event_title": "The Missing Seed Pouch",
             "event_phase_text": phase_text,
             "village_flow_text": flow_text,
+            "objective": self.missing_seeds.objective(self),
+            "contextual_action": self.missing_seeds.contextual_action(self),
             "toasts": toasts or [],
         }
 

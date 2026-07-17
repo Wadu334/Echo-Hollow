@@ -78,10 +78,15 @@ MESSAGE_SCHEMAS: dict[str, dict[str, FieldSpec]] = {
     },
     "investigate": {"subject_id": STRING},
     "investigate_location": {"location_id": STRING},
+    "activate_contextual_action": {
+        "action_id": STRING,
+        "offer_version": FieldSpec(int),
+    },
     "player_share_evidence": {
         "target_id": STRING,
         "evidence_id": OPTIONAL_EVIDENCE,
     },
+    "ack_presentation": {"presentation_id": STRING},
     "wait_minutes": {"minutes": OPTIONAL_MINUTES},
     "autonomous_step": {"actor_id": OPTIONAL_ACTOR},
     "run_village_step": {"actor_id": OPTIONAL_ACTOR},

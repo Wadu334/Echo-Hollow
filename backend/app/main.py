@@ -16,6 +16,7 @@ from .world import WorldSimulation
 
 TICK_INTERVAL_SECONDS = float(os.getenv("ECHO_HOLLOW_TICK_INTERVAL", "1.0"))
 WORLD_ID = os.getenv("ECHO_HOLLOW_WORLD_ID", "demo_world_001")
+RECOVERY_PAGE_SIZE = 500
 
 INDEX_HTML = """
 <!doctype html>
@@ -355,7 +356,7 @@ class WorldHub:
         self._lock = asyncio.Lock()
         self._dispatch_lock = asyncio.Lock()
 
-    async def connect(self, websocket: WebSocket) -> str:
+    async def connect(self, websocket: WebSocket, after_cursor: int | None = None) -> str:
         await websocket.accept()
         client_session_id = f"session_{uuid4().hex}"
         async with self._dispatch_lock:
@@ -363,11 +364,38 @@ class WorldHub:
                 self._clients.add(websocket)
                 self._client_sessions[websocket] = client_session_id
                 snapshot = self.world.snapshot()
+                snapshot_cursor = int(snapshot["event_log_cursor"])
+                recovery_pages: list[dict[str, Any]] = []
+                if after_cursor is not None:
+                    page_from_cursor = max(0, min(int(after_cursor), snapshot_cursor))
+                    while page_from_cursor < snapshot_cursor:
+                        events = self.world.events_after(
+                            page_from_cursor,
+                            limit=RECOVERY_PAGE_SIZE,
+                        )
+                        page_to_cursor = page_from_cursor + len(events)
+                        if page_to_cursor <= page_from_cursor:
+                            break
+                        recovery_pages.append(
+                            {
+                                "type": "recovery_events",
+                                "from_cursor": page_from_cursor,
+                                "to_cursor": page_to_cursor,
+                                "has_more": page_to_cursor < snapshot_cursor,
+                                "events": events,
+                            }
+                        )
+                        page_from_cursor = page_to_cursor
+            for page in recovery_pages:
+                await self.send_to(websocket, page)
             await self.send_to(
                 websocket,
                 {
                     "type": "world_state",
                     "client_session_id": client_session_id,
+                    # Kept as an empty compatibility field. Cursor recovery is
+                    # delivered in ordered pages before this snapshot.
+                    "recovery_events": [],
                     "data": snapshot,
                 },
             )
@@ -475,11 +503,18 @@ class WorldHub:
                 result = self.world.investigate(subject_id=validated["subject_id"])
             elif message_type == "investigate_location":
                 result = self.world.investigate_location(location_id=validated["location_id"])
+            elif message_type == "activate_contextual_action":
+                result = self.world.activate_contextual_action(
+                    action_id=validated["action_id"],
+                    offer_version=validated["offer_version"],
+                )
             elif message_type == "player_share_evidence":
                 result = self.world.player_share_evidence(
                     target_id=validated["target_id"],
                     evidence_id=validated["evidence_id"],
                 )
+            elif message_type == "ack_presentation":
+                result = self.world.ack_presentation(validated["presentation_id"])
             elif message_type == "wait_minutes":
                 result = self.world.wait_minutes(validated["minutes"])
             elif message_type == "autonomous_step":
@@ -600,10 +635,23 @@ async def get_world(world_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/world/{world_id}/events")
-async def get_events(world_id: str, limit: int = 50) -> dict[str, Any]:
+async def get_events(
+    world_id: str,
+    limit: int = 50,
+    after_cursor: int | None = None,
+) -> dict[str, Any]:
     if world_id != world.world_id:
         return {"error": "world_not_found", "world_id": world_id}
-    return {"world_id": world.world_id, "events": world.events(limit=limit)}
+    events = (
+        world.events_after(after_cursor, limit=limit)
+        if after_cursor is not None
+        else world.events(limit=limit)
+    )
+    return {
+        "world_id": world.world_id,
+        "event_log_cursor": world.snapshot()["event_log_cursor"],
+        "events": events,
+    }
 
 
 @app.get("/api/world/{world_id}/agent")
@@ -632,7 +680,16 @@ async def world_socket(websocket: WebSocket, world_id: str) -> None:
         await websocket.close(code=1008)
         return
 
-    client_session_id = await hub.connect(websocket)
+    after_cursor: int | None = None
+    raw_after_cursor = websocket.query_params.get("after_cursor")
+    if raw_after_cursor is not None:
+        try:
+            parsed_cursor = int(raw_after_cursor)
+            if parsed_cursor >= 0:
+                after_cursor = parsed_cursor
+        except ValueError:
+            after_cursor = None
+    client_session_id = await hub.connect(websocket, after_cursor=after_cursor)
     try:
         while True:
             message = await websocket.receive()

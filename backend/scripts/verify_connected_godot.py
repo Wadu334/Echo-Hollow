@@ -54,6 +54,12 @@ def parse_args() -> argparse.Namespace:
         help="Seconds used by the integration-only consequence scene.",
     )
     parser.add_argument("--godot-script", default=DEFAULT_GODOT_SCRIPT)
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=1,
+        help="Number of independent fresh-server verification runs.",
+    )
     return parser.parse_args()
 
 
@@ -115,8 +121,12 @@ def stop_process(process: subprocess.Popen[bytes]) -> str:
     return (output or b"").decode("utf-8", errors="replace").strip()
 
 
-def run_verification(args: argparse.Namespace) -> None:
-    godot = resolve_command(args.godot)
+def run_single_verification(
+    args: argparse.Namespace,
+    *,
+    godot: str,
+    run_number: int,
+) -> None:
     port = select_port(args.host, args.port)
     health_url = f"http://{args.host}:{port}/health"
     websocket_url = f"ws://{args.host}:{port}/ws/world/{args.world_id}"
@@ -148,6 +158,7 @@ def run_verification(args: argparse.Namespace) -> None:
     env["ECHO_HOLLOW_SERVER_URL"] = websocket_url
     env["ECHO_HOLLOW_WORLD_ID"] = args.world_id
     env["ECHO_HOLLOW_CUTSCENE_DURATION"] = str(args.cutscene_duration)
+    env["ECHO_HOLLOW_INTEGRATION_RUN"] = str(run_number)
     env["PYTHONUNBUFFERED"] = "1"
 
     server = subprocess.Popen(
@@ -161,7 +172,7 @@ def run_verification(args: argparse.Namespace) -> None:
     server_output = ""
     try:
         wait_for_health(health_url, server, args.startup_timeout)
-        print(f"Echo Hollow test server is healthy at {health_url}")
+        print(f"Run {run_number}: fresh Echo Hollow test server is healthy at {health_url}")
         result = subprocess.run(
             godot_command,
             cwd=REPO_ROOT,
@@ -196,7 +207,23 @@ def run_verification(args: argparse.Namespace) -> None:
             print(server_output, file=sys.stderr)
         raise failure
 
-    print(f"Connected Godot/FastAPI verification passed for {websocket_url}")
+    print(f"Run {run_number}: connected Godot/FastAPI verification passed for {websocket_url}")
+
+
+def run_verification(args: argparse.Namespace) -> None:
+    if args.runs < 1:
+        raise VerificationError("--runs must be at least 1.")
+    if args.runs > 1 and args.port:
+        raise VerificationError("Use --port 0 when --runs is greater than 1 so each run gets a fresh port.")
+
+    godot = resolve_command(args.godot)
+    for run_number in range(1, args.runs + 1):
+        run_single_verification(
+            args,
+            godot=godot,
+            run_number=run_number,
+        )
+    print(f"All {args.runs} fresh-server connected verification run(s) passed.")
 
 
 def main() -> int:

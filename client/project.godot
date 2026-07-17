@@ -11,6 +11,7 @@ config/features=PackedStringArray("4.3")
 
 [autoload]
 
+WorldPresenter="*res://scripts/world_presenter.gd"
 WorldConnection="*res://scripts/world_connection.gd"
 
 [display]

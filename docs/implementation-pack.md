@@ -20,6 +20,7 @@ For the current implementation snapshot, start with `current-state.md`.
 - `specs/13-playable-world-client-v0.md`: Godot WASD movement, imported pixel-cute assets, collision props, NPC routines, and agent state bubbles.
 - `specs/14-playable-world-v1-goal.md`: next playable loop goal, UX copy direction, and acceptance criteria.
 - `specs/15-playable-world-v2-rumor-handoff.md`: connection-scoped dialogue, authoritative movement reconciliation, rumor handoff, and the visible Mira-to-Tomo consequence.
+- `specs/16-playable-world-v2-1-evidence-closure.md`: explicit phase graph, Warehouse contextual evidence, offered-choice reconciliation, terminal integrity, cursor recovery, and acceptance evidence.
 
 ## Recommended Build Order
 
@@ -39,14 +40,22 @@ Completed foundation:
 12. Playable World v1 ordinary conversation UI and player-facing feedback.
 13. Playable World v2 Ivo-to-Mira rumor handoff, stateful choices, backend-authored movement, and visible agent consequence.
 
+Current verified increment:
+
+14. Playable World v2.1 Warehouse evidence closure, irreversible outcomes,
+    semantic action validation, server-authored reconciliation presentation,
+    and transient connection recovery. The 2026-07-17 automated record passes
+    backend, branch-coverage, Godot offline, recovery, and three fresh-server
+    connected runs.
+
 Recommended next build order:
 
-1. Repeatedly playtest and harden the connected v2 golden path.
-2. Improve player-facing provenance and movement-rejection feedback.
-3. Extend Missing Seeds investigation and evidence sharing without weakening the conversation/session contract.
-4. Add a compact optional debug overlay for world, conversation, and Director state.
-5. Add persistence after the connected playable loop feels reliable.
-6. Add LLM texture only after deterministic play remains stable.
+1. Complete a visible operator playtest of provenance, contextual prompt
+   priority, recovery status, and outcome wording with normal `WASD`/`E`
+   controls; the first desktop-control attempt was interrupted.
+2. Add a compact optional debug overlay for world, conversation, and Director state.
+3. Add persistence after the connected playable loop feels reliable.
+4. Add LLM texture only after deterministic play remains stable.
 
 ## Minimal Runtime Resources
 
@@ -86,14 +95,18 @@ Postgres + JSONB + pgvector remain good later targets once persistence and seman
 
 ## Immediate Next Step
 
-Stabilize the connected rumor-consequence slice:
+Preserve the verified v2.1 evidence and recovery slice:
 
 ```text
 Ivo rumor -> offered choice -> Mira memory -> validated fallback movement
--> accepted Mira/Tomo talk -> visible consequence -> authoritative restore
+-> accepted Mira/Tomo talk -> Warehouse contextual clue
+-> Mira evidence choice -> terminal reconciliation outcome
+-> cursor recovery -> exactly-once visible consequence
 ```
 
 Use `backend/scripts/verify_connected_godot.py` for a fresh, repeatable
-Godot-to-FastAPI run. Keep future work incremental: do not add a general
-cutscene framework, persistence, or LLM dialogue until the deterministic
-connected loop remains stable.
+Godot-to-FastAPI run, and use the commands, manual procedure, and final result
+record in `specs/16-playable-world-v2-1-evidence-closure.md`. Keep future work
+incremental: do not add a general cutscene framework, persistence, or LLM
+dialogue until the deterministic connected loop remains stable under long-run,
+replay, and transient-disconnect checks.

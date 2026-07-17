@@ -6,6 +6,8 @@ const MIRA_SHEET := ASSET_ROOT + "/sprites/mira_walk_4dir_4frame.png"
 const TOMO_SHEET := ASSET_ROOT + "/sprites/tomo_walk_4dir_4frame.png"
 
 var world_connection: Node
+var world_presenter: Node
+var presentation_id := ""
 var elapsed := 0.0
 var duration_seconds := 3.5
 var returning_to_main := false
@@ -13,7 +15,8 @@ var returning_to_main := false
 
 func _ready() -> void:
 	world_connection = get_node_or_null("/root/WorldConnection")
-	if world_connection == null:
+	world_presenter = get_node_or_null("/root/WorldPresenter")
+	if world_connection == null or world_presenter == null:
 		call_deferred("_return_to_main")
 		return
 
@@ -21,17 +24,17 @@ func _ready() -> void:
 	if not configured_duration.is_empty():
 		duration_seconds = maxf(0.05, float(configured_duration))
 
-	var payload: Dictionary = world_connection.rumor_consequence_payload
-	if not bool(world_connection.connected) or payload.is_empty():
+	var payload: Dictionary = world_presenter.begin_next_consequence()
+	if payload.is_empty():
+		payload = world_connection.rumor_consequence_payload
+	presentation_id = str(payload.get("presentation_id", ""))
+	if payload.is_empty() or presentation_id.is_empty():
 		call_deferred("_return_to_main")
 		return
 	_build_scene(payload)
 
 
 func _process(delta: float) -> void:
-	if world_connection == null or not bool(world_connection.connected):
-		_return_to_main()
-		return
 	elapsed += delta
 	if elapsed >= duration_seconds:
 		_return_to_main()
@@ -62,7 +65,7 @@ func _build_scene(payload: Dictionary) -> void:
 	add_child(ui)
 
 	var title := Label.new()
-	title.text = "A Rumor Reaches Tomo"
+	title.text = str(payload.get("title", "Village Consequence"))
 	title.position = Vector2(250, 72)
 	title.size = Vector2(460, 50)
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -71,7 +74,7 @@ func _build_scene(payload: Dictionary) -> void:
 	ui.add_child(title)
 
 	var line := Label.new()
-	line.text = "\"%s\"" % str(payload.get("line", "Mira asks Tomo about the missing seeds."))
+	line.text = "\"%s\"" % str(payload.get("line", ""))
 	line.position = Vector2(190, 148)
 	line.size = Vector2(580, 92)
 	line.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -81,28 +84,36 @@ func _build_scene(payload: Dictionary) -> void:
 	line.add_theme_color_override("font_color", Color(0.96, 0.91, 0.84, 1.0))
 	ui.add_child(line)
 
-	var mood := str(payload.get("tomo_mood", "hurt"))
 	var reaction := Label.new()
-	reaction.text = "Tomo looks %s. The accusation has landed." % mood
-	reaction.position = Vector2(250, 470)
-	reaction.size = Vector2(460, 34)
+	reaction.text = str(payload.get("reaction_text", ""))
+	reaction.position = Vector2(190, 452)
+	reaction.size = Vector2(580, 44)
 	reaction.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	reaction.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	reaction.add_theme_font_size_override("font_size", 16)
 	reaction.add_theme_color_override("font_color", Color(0.90, 0.70, 0.68, 1.0))
 	ui.add_child(reaction)
 
-	var relationship: Dictionary = payload.get("relationship", {})
 	var relationship_label := Label.new()
-	relationship_label.text = "Tomo → Mira   trust %.2f   affinity %.2f" % [
-		float(relationship.get("trust", 0.0)),
-		float(relationship.get("affinity", 0.0)),
-	]
-	relationship_label.position = Vector2(250, 510)
-	relationship_label.size = Vector2(460, 28)
+	relationship_label.text = str(payload.get("relationship_trend_text", ""))
+	relationship_label.position = Vector2(190, 500)
+	relationship_label.size = Vector2(580, 28)
 	relationship_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	relationship_label.add_theme_font_size_override("font_size", 14)
 	relationship_label.add_theme_color_override("font_color", Color(0.76, 0.78, 0.80, 1.0))
 	ui.add_child(relationship_label)
+
+	var reflection_text := str(payload.get("reflection_text", "")).strip_edges()
+	if not reflection_text.is_empty():
+		var reflection := Label.new()
+		reflection.text = reflection_text
+		reflection.position = Vector2(190, 532)
+		reflection.size = Vector2(580, 42)
+		reflection.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		reflection.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		reflection.add_theme_font_size_override("font_size", 13)
+		reflection.add_theme_color_override("font_color", Color(0.82, 0.82, 0.76, 1.0))
+		ui.add_child(reflection)
 
 	var hint := Label.new()
 	hint.text = "Space / Esc to continue"
@@ -139,6 +150,9 @@ func _return_to_main() -> void:
 	if returning_to_main:
 		return
 	returning_to_main = true
-	if world_connection != null:
-		world_connection.clear_rumor_consequence()
-	get_tree().change_scene_to_file("res://scenes/main.tscn")
+	var error := get_tree().change_scene_to_file("res://scenes/main.tscn")
+	if error != OK:
+		returning_to_main = false
+		return
+	if world_connection != null and not presentation_id.is_empty():
+		world_connection.ack_presentation(presentation_id)

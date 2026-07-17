@@ -37,7 +37,12 @@ class DeterministicAIProvider:
             return AIActionProposal(
                 tool_name="npc_investigate",
                 actor_id=actor_id,
-                args={"actor_id": actor_id, "subject_id": "warehouse"},
+                args={
+                    "actor_id": actor_id,
+                    "subject_id": "warehouse",
+                    "episode_id": "evt_missing_seeds",
+                    "causal_claim_id": "tomo_took_seeds",
+                },
                 priority=8,
                 reason="Mira has learned to verify seed rumors before accusing Tomo.",
                 source_memory_ids=source_memory_ids,
@@ -47,7 +52,14 @@ class DeterministicAIProvider:
             return AIActionProposal(
                 tool_name="npc_talk_to",
                 actor_id=actor_id,
-                args={"actor_id": actor_id, "target_id": target_id, "topic": "missing_seeds"},
+                args={
+                    "actor_id": actor_id,
+                    "target_id": target_id,
+                    "topic": "missing_seeds",
+                    "episode_id": "evt_missing_seeds",
+                    "social_act": "careful_confrontation" if target_id == "tomo" else "check_in",
+                    "causal_claim_id": "tomo_took_seeds",
+                },
                 priority=7,
                 reason="Mira should question the named villager before the rumor hardens.",
                 source_memory_ids=source_memory_ids,

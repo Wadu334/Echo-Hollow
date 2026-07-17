@@ -16,6 +16,7 @@ This repository currently proves the non-LLM foundation:
 - VillageDirector v0 orchestration layer
 - memory, relationship, rumor, and validator state
 - Ivo rumor -> player claim -> Mira memory -> Agent proposal -> Director fallback -> visible consequence scene
+- Playable World v2.1 evidence-closure contract: Warehouse clue -> Mira offered choice -> server-authored reconciliation outcome
 
 LLM dialogue is intentionally not connected yet. The current agent and director loops are deterministic so the gameplay spine can be tested before model integration.
 
@@ -32,6 +33,8 @@ NPC AgentRuntime -> VillageDirector -> Validator -> WorldSimulation -> EpisodeMa
 - Validators are the hard legality gate for every tool execution.
 - `WorldSimulation` is the only authority that mutates actor locations, memories, relationships, rumors, event logs, and facts.
 - `MissingSeedsEpisodeManager` owns scenario phase transitions and final endings.
+- Focused Missing Seeds rules own clue availability, terminal guards,
+  idempotency, causal-confrontation checks, and resolution compatibility.
 - AI/LLM providers are advisory only and are disabled by default.
 
 The Director is not a God Agent. It does not change relationships, write NPC memories, create facts, or resolve events directly. It only schedules validated actions and records compact public traces.
@@ -53,6 +56,7 @@ The Director is not a God Agent. It does not change relationships, write NPC mem
 - `docs/specs/13-playable-world-client-v0.md`: Godot playable client, imported assets, movement, collision, NPC routines, and state bubbles.
 - `docs/specs/14-playable-world-v1-goal.md`: ordinary NPC conversation goal and player-facing UX baseline.
 - `docs/specs/15-playable-world-v2-rumor-handoff.md`: stateful rumor handoff, authoritative movement reconciliation, and visible agent consequence.
+- `docs/specs/16-playable-world-v2-1-evidence-closure.md`: explicit episode graph, evidence closure, terminal integrity, recovery, and final acceptance evidence.
 
 ## Backend Setup
 
@@ -79,14 +83,20 @@ Useful endpoints:
 
 The backend is intentionally not a per-frame coordinate server. Godot owns WASD input, collision, smooth movement, camera feel, and visual coordinates. The backend stays authoritative for logical location, interactions, memory, relationships, Director scheduling, episode state, and event logs.
 
-Playable WebSocket commands:
+Normal Godot play uses these WebSocket commands:
 
 - `player_entered_location`: Godot notifies the backend that the player entered a logical area.
 - `player_interact_npc`: opens deterministic NPC dialogue when the player and NPC share a logical location.
 - `dialogue_choice`: applies deterministic choice effects and returns a toast plus optional `world_diff`.
-- `investigate_location`: logical investigation alias for playable clients.
-- `wait_minutes`: advances world time.
-- `run_village_step`: asks the VillageDirector/AgentRuntime path to run one autonomous step.
+- `activate_contextual_action`: activates the Warehouse clue currently offered
+  by authoritative presentation state; the client supplies no evidence or
+  recipient id.
+- `ack_presentation`: acknowledges an exactly-once consequence after it is shown.
+
+Dashboard buttons, direct simulation calls, `wait_minutes`, `run_village_step`,
+raw `investigate_location`, and arbitrary `player_share_evidence` payloads are
+debug or regression surfaces. They do **not** count as proof that the normal
+Godot path is playable.
 
 Dialogue responses now carry a connection-owned conversation and offered-choice
 version:
@@ -108,7 +118,9 @@ version:
 Choice submissions must echo `conversation_id`, `offer_version`, and
 `choice_id`. The server rejects stale, replayed, cross-session, or unoffered
 choices without mutating the world. See
-`docs/specs/15-playable-world-v2-rumor-handoff.md` for the complete contract.
+`docs/specs/15-playable-world-v2-rumor-handoff.md` for the conversation contract
+and `docs/specs/16-playable-world-v2-1-evidence-closure.md` for the evidence
+choice and terminal-outcome contract.
 
 World diffs may include:
 
@@ -127,6 +139,7 @@ World diffs may include:
     "event_title": "The Missing Seed Pouch",
     "event_phase_text": "Gathering Clues",
     "village_flow_text": "Neighbors are comparing small clues and trying to be fair.",
+    "objective": "Check the Warehouse",
     "toasts": []
   }
 }
@@ -139,6 +152,15 @@ presentation. A persistent `WorldConnection` Autoload keeps the socket alive
 through the rumor-consequence scene. The number keys remain debug helpers for
 logical location checks. See `docs/current-state.md` for the current capability
 map.
+
+For v2.1, `WorldConnection` retains its last consumed event cursor across an
+unexpected transport loss, reconnects with capped exponential backoff, requests
+events after that cursor in ordered pages of at most 500 entries, and then
+applies a full authoritative snapshot. Each recovery page carries
+`from_cursor`, `to_cursor`, and `has_more`; the client becomes `Online` only
+when the consumed cursor exactly matches the snapshot cursor. A persistent
+presenter deduplicates pending consequences by `presentation_id`, so the
+reconciliation scene is neither lost nor shown twice after recovery.
 
 The dashboard includes Agent Tool buttons. For example, move the player to Workshop, then use `Tell Mira: Tomo rumor` to trigger:
 
@@ -156,15 +178,19 @@ director_state
 ## Backend Verification
 
 ```powershell
-python -m unittest discover -s backend\tests
-python backend\scripts\probe_episode.py
-python backend\scripts\probe_websocket.py
-python backend\scripts\verify_connected_godot.py --godot "<Godot console path>"
+.\.venv\Scripts\python.exe -m unittest discover -s backend\tests -v
+
+.\.venv\Scripts\python.exe -m coverage erase
+.\.venv\Scripts\python.exe -m coverage run --branch --source=backend.app `
+  -m unittest discover -s backend\tests -v
+.\.venv\Scripts\python.exe -m coverage report --show-missing
 ```
 
-`probe_websocket.py` expects the backend server to be running;
-`probe_episode.py` runs the deterministic simulation in-process. The connected
-Godot verification starts and stops its own fresh Uvicorn process.
+Coverage is branch-aware because the new Missing Seeds rejection and no-op
+branches are part of the acceptance contract. Do not infer v2.1 completion from
+the previous 67-test baseline alone. The final v2.1 run passes 89 tests with
+80% total branch coverage; `missing_seeds.py` is 95%, `protocol.py` is 98%,
+`director.py` is 86%, `world.py` is 83%, and `episode.py` is 82%.
 
 ## Godot Headless Verification
 
@@ -173,13 +199,27 @@ If Godot 4.x is available:
 ```powershell
 godot_console --headless --path client --quit --verbose
 godot_console --headless --path client --script res://tests/verify_client.gd
-python backend\scripts\verify_connected_godot.py --godot "godot_console"
+.\.venv\Scripts\python.exe backend\scripts\verify_connected_godot.py `
+  --godot "godot_console"
 ```
 
 The first command confirms the project and main scene load. The second runs the
 offline client display contract. The third runs a real Godot-to-FastAPI
 WebSocket check, including authoritative reconciliation and the consequence
-scene transition.
+scene transition. The final v2.1 connected scenario also completes the
+Warehouse evidence path, catches up the named `torn_seed_bag` evidence event
+after a transient disconnect, and proves each presentation scene enters once.
+
+Fresh-world repeatability requires three independent harness processes:
+
+```powershell
+.\.venv\Scripts\python.exe backend\scripts\verify_connected_godot.py `
+  --godot "godot_console" --runs 3 --godot-timeout 120
+```
+
+The harness starts and stops a new Uvicorn process for every run. The final
+2026-07-17 record passed all three fresh servers; details are in
+`docs/specs/16-playable-world-v2-1-evidence-closure.md`.
 
 ## Godot Client
 
@@ -188,9 +228,10 @@ Open `client/project.godot` in Godot 4.x and run the main scene.
 Controls:
 
 - `WASD`: move player
-- `E`: interact with nearest NPC
+- `E`: interact with the clearly named nearby NPC or current contextual clue
 - `B`: toggle NPC state bubbles
-- `1-5`: jump to logical locations for debugging
+- `1-5`: jump to logical locations only when
+  `ECHO_HOLLOW_DEBUG_CONTROLS=1`
 
 The client connects by default to:
 
@@ -199,3 +240,15 @@ ws://127.0.0.1:8000/ws/world/demo_world_001
 ```
 
 Override the URL with `ECHO_HOLLOW_SERVER_URL`.
+
+The no-debug acceptance path is:
+
+```text
+Ask Ivo -> Tell Mira -> Check the Warehouse
+-> Show Mira the evidence -> Observe the outcome
+```
+
+Use only `WASD`, `E`, and server-provided choices. Do not use the dashboard,
+number-key jumps, or raw WebSocket commands. The complete manual procedure and
+final automated verification record are in
+`docs/specs/16-playable-world-v2-1-evidence-closure.md`.

@@ -152,26 +152,9 @@ class AgentRuntimeV1:
                 )
             return decision
 
-        proposal = decision.tool_proposal
-        action_id = world.enqueue_action(
-            actor_id=proposal.actor_id,
-            tool_name=proposal.tool_name,
-            args=proposal.args,
-            priority=proposal.priority,
-            execute_after_minute=int(decision.context["world_minute"]),
-            expires_at_minute=int(decision.context["world_minute"]) + self.ttl_minutes,
-            source_memory_ids=proposal.source_memory_ids,
-            reason=proposal.reason,
-        )
-        return AgentRuntimeDecision(
-            actor_id=decision.actor_id,
-            decision="action_queued",
-            context=decision.context,
-            steps=decision.steps,
-            tool_proposal=proposal,
-            queued_action_id=action_id,
-            public_reason=decision.public_reason,
-        )
+        # AgentRuntime is proposal-only. A world without a Director may inspect
+        # the proposal, but it must not acquire a hidden mutation path.
+        return decision
 
     def assemble_context(
         self,
@@ -221,9 +204,19 @@ class AgentRuntimeV1:
         }
 
     def _select_proposal(self, world: Any, context: dict[str, Any]) -> AIActionProposal:
-        provider_proposal = self.provider.propose_action(context)
         actor_id = str(context["actor_id"])
         phase = str(context["episode_phase"])
+
+        if phase.startswith("resolved_"):
+            return AIActionProposal(
+                tool_name="noop",
+                actor_id=actor_id,
+                args={"actor_id": actor_id},
+                priority=0,
+                reason="The Missing Seeds episode is already resolved.",
+            )
+
+        provider_proposal = self.provider.propose_action(context)
 
         if provider_proposal.tool_name != "noop":
             return provider_proposal
@@ -239,14 +232,26 @@ class AgentRuntimeV1:
                     return AIActionProposal(
                         tool_name="npc_investigate",
                         actor_id="mira",
-                        args={"actor_id": "mira", "subject_id": "warehouse"},
+                        args={
+                            "actor_id": "mira",
+                            "subject_id": "warehouse",
+                            "episode_id": "evt_missing_seeds",
+                            "causal_claim_id": "tomo_took_seeds",
+                        },
                         priority=8,
                         reason="Mira's reflection modifier favors checking the warehouse before accusing Tomo.",
                     )
                 return AIActionProposal(
                     tool_name="npc_talk_to",
                     actor_id="mira",
-                    args={"actor_id": "mira", "target_id": "tomo", "topic": "missing_seeds"},
+                    args={
+                        "actor_id": "mira",
+                        "target_id": "tomo",
+                        "topic": "missing_seeds",
+                        "episode_id": "evt_missing_seeds",
+                        "social_act": "careful_confrontation",
+                        "causal_claim_id": "tomo_took_seeds",
+                    },
                     priority=7,
                     reason="Mira needs to confront the named villager before rumor confidence rises.",
                 )
@@ -257,7 +262,12 @@ class AgentRuntimeV1:
                 return AIActionProposal(
                     tool_name="npc_gossip",
                     actor_id="mira",
-                    args={"actor_id": "mira", "target_id": "ivo", "rumor_id": rumor.rumor_id},
+                    args={
+                        "actor_id": "mira",
+                        "target_id": "ivo",
+                        "rumor_id": rumor.rumor_id,
+                        "episode_id": "evt_missing_seeds",
+                    },
                     priority=4,
                     reason="Without evidence, Mira may repeat the rumor to Ivo and amplify suspicion.",
                 )

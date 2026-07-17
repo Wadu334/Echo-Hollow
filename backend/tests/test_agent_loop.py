@@ -32,7 +32,7 @@ class AgentLoopTests(unittest.TestCase):
         diff = world.share_claim(target_id="mira", claim_id="tomo_took_seeds")
 
         self.assertEqual(diff["reason"], "memory_shared")
-        self.assertEqual(world.world_events["evt_missing_seeds"]["phase"], "conflicting_claims")
+        self.assertEqual(world.world_events["evt_missing_seeds"]["phase"], "confrontation_pending")
         self.assertIn("mira", diff["memories"])
         self.assertTrue(any(memory["type"] == "episodic" for memory in diff["memories"]["mira"]))
         self.assertTrue(any(memory["type"] == "rumor" for memory in diff["memories"]["mira"]))
@@ -68,6 +68,11 @@ class AgentLoopTests(unittest.TestCase):
 
     def test_investigate_warehouse_verifies_evidence_fact(self) -> None:
         world = WorldSimulation()
+        world.move_player("workshop")
+        world.share_claim(target_id="mira", claim_id="tomo_took_seeds")
+        for _ in range(3):
+            world.tick()
+        world.move_player("square")
         world.move_player("warehouse")
 
         diff = world.investigate("warehouse")

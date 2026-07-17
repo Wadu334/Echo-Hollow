@@ -9,6 +9,7 @@ const SPRITE_CELL_SIZE := 128
 const PLAYER_SPEED := 150.0
 const NPC_SPEED := 56.0
 const INTERACTION_DISTANCE := 72.0
+const CONTEXTUAL_INTERACTION_DISTANCE := 52.0
 
 const ASSET_ROOT := "res://assets/playable_world_v0"
 const PLAYER_SHEET := ASSET_ROOT + "/sprites/player_walk_4dir_4frame.png"
@@ -53,6 +54,10 @@ const LOCATION_CENTERS := {
 	"farm": Vector2(790, 430),
 	"workshop": Vector2(230, 500),
 	"warehouse": Vector2(760, 180),
+}
+
+const CONTEXTUAL_ACTION_ANCHORS := {
+	"warehouse": Vector2(840, 230),
 }
 
 const LOCATION_RECTS := {
@@ -150,9 +155,11 @@ var actor_tweens: Dictionary = {}
 var authoritative_actor_locations: Dictionary = {}
 var location_nodes: Dictionary = {}
 var location_positions: Dictionary = {}
+var contextual_marker_nodes: Dictionary = {}
 var npc_state: Dictionary = {}
 var bubbles_visible := true
 var enable_server_connection := true
+var debug_controls_enabled := false
 var local_player_location := "square"
 var pending_player_location := ""
 var last_interaction_text := "Walk up to a villager and press E to talk."
@@ -167,6 +174,7 @@ var player_body: CharacterBody2D
 var tile_texture: Texture2D
 var prop_texture: Texture2D
 var world_connection: Node
+var world_presenter: Node
 
 @onready var world_root := Node2D.new()
 @onready var tile_root := Node2D.new()
@@ -187,12 +195,14 @@ var world_connection: Node
 
 
 func _ready() -> void:
+	debug_controls_enabled = OS.get_environment("ECHO_HOLLOW_DEBUG_CONTROLS").strip_edges().to_lower() in ["1", "true", "yes"]
 	_load_textures()
 	_build_world_scene()
 	_build_static_ui()
 	_spawn_player()
 	_spawn_npcs()
 	_update_bubble_visibility()
+	_bind_world_presenter()
 	if enable_server_connection:
 		_bind_world_connection()
 		_attempt_server_connection()
@@ -227,17 +237,22 @@ func _unhandled_input(event: InputEvent) -> void:
 				bubbles_visible = not bubbles_visible
 				_update_bubble_visibility()
 			KEY_E:
-				_interact_with_nearest_npc()
+				_activate_current_interaction()
 			KEY_1:
-				_jump_player_to_location("square")
+				if debug_controls_enabled:
+					_jump_player_to_location("square")
 			KEY_2:
-				_jump_player_to_location("tavern")
+				if debug_controls_enabled:
+					_jump_player_to_location("tavern")
 			KEY_3:
-				_jump_player_to_location("farm")
+				if debug_controls_enabled:
+					_jump_player_to_location("farm")
 			KEY_4:
-				_jump_player_to_location("workshop")
+				if debug_controls_enabled:
+					_jump_player_to_location("workshop")
 			KEY_5:
-				_jump_player_to_location("warehouse")
+				if debug_controls_enabled:
+					_jump_player_to_location("warehouse")
 
 
 func _load_textures() -> void:
@@ -264,11 +279,23 @@ func _attempt_server_connection() -> void:
 	world_connection.ensure_connected()
 
 
+func _bind_world_presenter() -> void:
+	world_presenter = get_node_or_null("/root/WorldPresenter")
+	if world_presenter == null:
+		return
+	var presentation_callable := Callable(self, "_on_presentation_changed")
+	if not world_presenter.is_connected("presentation_changed", presentation_callable):
+		world_presenter.connect("presentation_changed", presentation_callable)
+	if world_presenter.has_pending_consequence():
+		call_deferred("_on_rumor_consequence_ready", world_presenter.peek_next_consequence())
+
+
 func _bind_world_connection() -> void:
 	world_connection = get_node_or_null("/root/WorldConnection")
 	if world_connection == null:
 		return
 	_connect_world_signal("connection_changed", "_on_connection_changed")
+	_connect_world_signal("connection_status_changed", "_on_connection_status_changed")
 	_connect_world_signal("world_state_received", "_on_world_state_received")
 	_connect_world_signal("world_diff_received", "_on_world_diff_received")
 	_connect_world_signal("dialogue_opened", "_on_dialogue_opened")
@@ -301,13 +328,24 @@ func _on_connection_changed(is_connected: bool) -> void:
 		if not cached_world.is_empty():
 			_on_world_state_received(cached_world)
 	elif has_connected_once:
-		pending_rumor_scene = false
 		_freeze_local_npcs()
 		_close_dialogue()
 
 
+func _on_connection_status_changed(_status: String) -> void:
+	_update_status_label()
+
+
+func _on_presentation_changed(_presentation: Dictionary) -> void:
+	_update_contextual_markers()
+	_update_status_label()
+	_render_events(world_data.get("latest_events", []))
+
+
 func _on_world_state_received(data: Dictionary) -> void:
 	world_data = data.duplicate(true)
+	if world_presenter != null:
+		world_presenter.ingest_world_data(world_data)
 	_reconcile_authoritative_world({}, true)
 
 
@@ -316,6 +354,8 @@ func _on_world_diff_received(diff: Dictionary) -> void:
 		world_data = world_connection.world_data.duplicate(true)
 	else:
 		_merge_world_diff(diff)
+		if world_presenter != null:
+			world_presenter.ingest_world_data(world_data)
 	_reconcile_authoritative_world(diff, false)
 
 
@@ -358,7 +398,13 @@ func _on_rumor_consequence_ready(_payload: Dictionary) -> void:
 
 
 func _open_rumor_consequence_scene() -> void:
-	if world_connection == null or not connected:
+	if world_presenter != null:
+		var consequence_payload: Dictionary = world_presenter.begin_next_consequence()
+		if consequence_payload.is_empty():
+			scene_transition_started = false
+			pending_rumor_scene = false
+			return
+	if world_connection == null:
 		scene_transition_started = false
 		pending_rumor_scene = false
 		return
@@ -378,6 +424,7 @@ func _build_world_scene() -> void:
 
 	_build_tile_ground()
 	_build_location_markers()
+	_build_contextual_markers()
 	_build_props()
 
 
@@ -464,6 +511,53 @@ func _add_location_sign(location_id: String, marker: Node2D) -> void:
 	sign.add_child(label)
 
 
+func _build_contextual_markers() -> void:
+	for location_id in CONTEXTUAL_ACTION_ANCHORS.keys():
+		var marker := Node2D.new()
+		marker.name = "%s_contextual_clue" % location_id
+		marker.position = CONTEXTUAL_ACTION_ANCHORS[location_id]
+		marker.visible = false
+		location_root.add_child(marker)
+		contextual_marker_nodes[location_id] = marker
+
+		var diamond := Polygon2D.new()
+		diamond.polygon = PackedVector2Array([
+			Vector2(0, -9),
+			Vector2(9, 0),
+			Vector2(0, 9),
+			Vector2(-9, 0),
+		])
+		diamond.color = Color(1.0, 0.78, 0.30, 0.92)
+		marker.add_child(diamond)
+
+		var label := Label.new()
+		label.name = "ClueLabel"
+		label.text = "Clue"
+		label.position = Vector2(-80, -34)
+		label.size = Vector2(160, 20)
+		label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		label.add_theme_font_size_override("font_size", 11)
+		label.add_theme_color_override("font_color", Color(1.0, 0.92, 0.68, 1.0))
+		label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.9))
+		label.add_theme_constant_override("outline_size", 3)
+		marker.add_child(label)
+
+
+func _update_contextual_markers() -> void:
+	for marker_value in contextual_marker_nodes.values():
+		(marker_value as Node2D).visible = false
+	if world_presenter == null:
+		return
+	var action: Dictionary = world_presenter.current_contextual_action()
+	var location_id := str(action.get("location_id", ""))
+	if str(action.get("action_id", "")).is_empty() or not contextual_marker_nodes.has(location_id):
+		return
+	var marker: Node2D = contextual_marker_nodes[location_id]
+	marker.visible = true
+	var label: Label = marker.get_node("ClueLabel")
+	label.text = str(action.get("label", "Clue"))
+
+
 func _build_props() -> void:
 	_add_prop("well", Rect2(0, 0, 256, 256), Vector2(480, 365), Vector2(76, 58), Vector2(0, -20), 0.46)
 	_add_prop("noticeboard", Rect2(256, 0, 256, 256), Vector2(395, 250), Vector2(84, 24), Vector2(0, -20), 0.44)
@@ -513,7 +607,9 @@ func _build_static_ui() -> void:
 
 	hint_label.position = Vector2(16, 606)
 	hint_label.add_theme_font_size_override("font_size", 14)
-	hint_label.text = "WASD move | E talk | B bubbles | F11 fullscreen | 1-5 debug jump"
+	hint_label.text = "WASD move | E interact | B bubbles | F11 fullscreen"
+	if debug_controls_enabled:
+		hint_label.text += " | 1-5 debug jump"
 	ui_layer.add_child(hint_label)
 
 	event_label.position = Vector2(676, 18)
@@ -816,23 +912,41 @@ func _update_bubble_visibility() -> void:
 
 
 func _interact_with_nearest_npc() -> void:
-	var nearest_id := _nearest_talkable_npc_id()
-	if nearest_id == "":
-		last_interaction_text = "Move closer to a villager, then press E."
-		_show_toast(last_interaction_text)
-		return
+	_activate_current_interaction()
 
-	last_interaction_text = "Opening conversation with %s..." % ACTOR_NAMES[nearest_id]
-	_send_interact_npc(nearest_id)
+
+func _activate_current_interaction() -> void:
+	var interaction := _current_interaction()
+	var interaction_kind := str(interaction.get("kind", ""))
+	if interaction_kind == "npc":
+		var npc_id := str(interaction.get("npc_id", ""))
+		last_interaction_text = "Opening conversation with %s..." % ACTOR_NAMES.get(npc_id, npc_id.capitalize())
+		_send_interact_npc(npc_id)
+		return
+	if interaction_kind == "contextual_action":
+		var action_id := str(interaction.get("action_id", ""))
+		var offer_version := int(interaction.get("offer_version", 0))
+		last_interaction_text = str(interaction.get("label", "Checking this clue..."))
+		_send_activate_contextual_action(action_id, offer_version)
+		return
+	last_interaction_text = "Move closer to a villager or an available clue, then press E."
+	_show_toast(last_interaction_text)
 
 
 func _update_status_label() -> void:
-	var connection_text := "Online" if connected else "Local"
+	var connection_text := "Offline"
+	if world_connection != null:
+		connection_text = str(world_connection.connection_status)
+	elif not enable_server_connection:
+		connection_text = "Offline Demo"
 	status_label.text = "Echo Hollow | %s | %s" % [
 		connection_text,
 		_pretty_location(local_player_location),
 	]
-	objective_label.text = "Next: %s" % _current_player_prompt()
+	var objective := _server_objective()
+	if objective.is_empty():
+		objective = _current_player_prompt()
+	objective_label.text = "Next: %s" % objective
 
 
 func _nearest_talkable_npc_id() -> String:
@@ -857,12 +971,56 @@ func _update_approach_prompt() -> void:
 	if dialogue_panel.visible:
 		approach_label.visible = false
 		return
-	var nearest_id := _nearest_talkable_npc_id()
-	if nearest_id == "":
+	var interaction := _current_interaction()
+	if interaction.is_empty():
 		approach_label.visible = false
 		return
-	approach_label.text = "Press E to talk to %s" % ACTOR_NAMES.get(nearest_id, nearest_id.capitalize())
+	approach_label.text = str(interaction.get("prompt", "Press E to interact"))
 	approach_label.visible = true
+
+
+func _current_interaction() -> Dictionary:
+	if has_connected_once and not connected:
+		return {}
+	var nearest_id := _nearest_talkable_npc_id()
+	var npc_candidate: Dictionary = {}
+	var npc_distance := INF
+	if not nearest_id.is_empty():
+		npc_distance = player_body.position.distance_to(actor_nodes[nearest_id].position)
+		npc_candidate = {
+			"kind": "npc",
+			"npc_id": nearest_id,
+			"distance": npc_distance,
+			"prompt": "Press E to talk to %s" % ACTOR_NAMES.get(nearest_id, nearest_id.capitalize()),
+		}
+
+	var contextual_candidate: Dictionary = {}
+	if world_presenter != null and connected:
+		var action: Dictionary = world_presenter.current_contextual_action()
+		var action_id := str(action.get("action_id", ""))
+		var offered_location := str(action.get("location_id", ""))
+		if (
+			not action_id.is_empty()
+			and action.has("offer_version")
+			and offered_location == local_player_location
+			and CONTEXTUAL_ACTION_ANCHORS.has(offered_location)
+		):
+			var contextual_distance := player_body.position.distance_to(CONTEXTUAL_ACTION_ANCHORS[offered_location])
+			if contextual_distance <= CONTEXTUAL_INTERACTION_DISTANCE:
+				contextual_candidate = {
+					"kind": "contextual_action",
+					"action_id": action_id,
+					"offer_version": int(action.get("offer_version", 0)),
+					"label": str(action.get("label", "Inspect the clue")),
+					"distance": contextual_distance,
+					"prompt": str(action.get("prompt", "Press E to %s" % str(action.get("label", "inspect the clue")).to_lower())),
+				}
+
+	if not contextual_candidate.is_empty() and (
+		npc_candidate.is_empty() or float(contextual_candidate["distance"]) < npc_distance
+	):
+		return contextual_candidate
+	return npc_candidate
 
 
 func _update_toast(delta: float) -> void:
@@ -997,6 +1155,7 @@ func _merge_world_diff(diff: Dictionary) -> void:
 		"last_relationship_change",
 		"actor_movements",
 		"presentation",
+		"pending_presentations",
 	]:
 		if diff.has(key):
 			world_data[key] = diff[key]
@@ -1138,10 +1297,13 @@ func _sync_bubbles_from_world() -> void:
 			continue
 		var label: Label = bubble.get_node("StateLabel")
 		var memory_count := 0
-		var memories: Dictionary = world_data.get("memories", {})
-		for memory_value in memories.values():
-			if typeof(memory_value) == TYPE_DICTIONARY and str(memory_value.get("owner_id", "")) == npc_id:
-				memory_count += 1
+		var memories_value = world_data.get("memories", {})
+		if typeof(memories_value) == TYPE_DICTIONARY:
+			var owner_memories = (memories_value as Dictionary).get(npc_id, [])
+			if typeof(owner_memories) == TYPE_ARRAY:
+				memory_count = (owner_memories as Array).size()
+			elif typeof(owner_memories) == TYPE_DICTIONARY:
+				memory_count = (owner_memories as Dictionary).size()
 		var rumor_count := 0
 		var rumors: Dictionary = world_data.get("rumors", {})
 		for rumor_value in rumors.values():
@@ -1159,15 +1321,21 @@ func _sync_bubbles_from_world() -> void:
 
 
 func _render_events(events: Array) -> void:
-	var presentation: Dictionary = world_data.get("presentation", {})
-	var title := "Village"
-	var phase_text := "Talk with villagers and learn who they are."
-	var toasts = presentation.get("toasts", [])
+	var presentation_data: Dictionary = world_data.get("presentation", {})
+	if world_presenter != null and not world_presenter.presentation.is_empty():
+		presentation_data = world_presenter.presentation
+	var title := str(presentation_data.get("event_title", "Village"))
+	var phase_text := str(presentation_data.get("event_phase_text", "Village Day"))
+	var flow_text := str(presentation_data.get("village_flow_text", "Talk with villagers and learn who they are."))
+	var objective := str(presentation_data.get("objective", "")).strip_edges()
+	var toasts = presentation_data.get("toasts", [])
 	var lines: Array[String] = [
 		"[b]%s[/b]" % title,
 		phase_text,
-		"Next: %s" % _current_player_prompt(),
+		flow_text,
 	]
+	if not objective.is_empty():
+		lines.append("Next: %s" % objective)
 	if typeof(toasts) == TYPE_ARRAY and not toasts.is_empty():
 		lines.append("Update: %s" % str(toasts[toasts.size() - 1]))
 	lines.append("")
@@ -1184,14 +1352,26 @@ func _render_events(events: Array) -> void:
 func _current_player_prompt() -> String:
 	if dialogue_panel.visible:
 		return "Choose a topic, or press Esc to close the conversation."
-	if not last_interaction_text.is_empty():
-		return last_interaction_text
+	var interaction := _current_interaction()
+	if not interaction.is_empty():
+		return str(interaction.get("prompt", "Press E to interact")).trim_prefix("Press E to ").capitalize()
 	var player = world_data.get("player", {})
 	if typeof(player) == TYPE_DICTIONARY:
 		var notes = player.get("notes", [])
 		if typeof(notes) == TYPE_ARRAY and not notes.is_empty():
 			return "You learned something new. Talk to another villager."
 	return "Walk up to a villager and press E to talk."
+
+
+func _server_objective() -> String:
+	if world_presenter != null:
+		var presenter_objective := str(world_presenter.objective_text()).strip_edges()
+		if not presenter_objective.is_empty():
+			return presenter_objective
+	var presentation_data = world_data.get("presentation", {})
+	if typeof(presentation_data) == TYPE_DICTIONARY:
+		return str(presentation_data.get("objective", "")).strip_edges()
+	return ""
 
 
 func _event_display_label(event_type: String) -> String:
@@ -1247,6 +1427,14 @@ func _send_interact_npc(npc_id: String) -> void:
 		_show_toast("Village server is not connected yet.")
 		return
 	world_connection.send_interact_npc(npc_id)
+
+
+func _send_activate_contextual_action(action_id: String, offer_version: int) -> void:
+	if world_connection == null or not connected:
+		_show_toast("Village server is not connected yet.")
+		return
+	if not world_connection.send_activate_contextual_action(action_id, offer_version):
+		_show_toast("That interaction is no longer available.")
 
 
 func _send_dialogue_choice(choice_id: String) -> void:

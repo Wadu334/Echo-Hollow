@@ -110,6 +110,8 @@ class VillageDirector:
     def on_memory_written(self, world: Any, memory: Any) -> list[str]:
         if memory.owner_id not in world.npcs or memory.topic != "missing_seeds":
             return []
+        if world.missing_seeds.is_terminal(world):
+            return []
         if not self._has_agent_step_budget(world):
             decision = self._decision(
                 decision_type="budget_skipped",
@@ -151,6 +153,18 @@ class VillageDirector:
             return decision
 
         proposal_dict = proposal.to_dict()
+        if proposal.args.get("episode_id") == "evt_missing_seeds" and world.missing_seeds.is_terminal(world):
+            decision = self._decision(
+                decision_type="reject",
+                actor_id=proposal.actor_id,
+                tool_name=proposal.tool_name,
+                priority=proposal.priority,
+                reason="The Missing Seeds episode is already resolved.",
+                source="agent_runtime",
+                proposal=proposal_dict,
+            )
+            self._record_trace(world, "Director rejected a proposal for a resolved episode.", [decision])
+            return decision
         if world.has_pending_action(proposal.actor_id, proposal.tool_name, proposal.args):
             decision = self._decision(
                 decision_type="duplicate_skipped",
@@ -214,15 +228,21 @@ class VillageDirector:
     ) -> DirectorDecision | None:
         if action.tool_name != "npc_talk_to" or validation_result.get("rejection_code") != "target_unavailable":
             return None
+        if action.args.get("episode_id") == "evt_missing_seeds" and world.missing_seeds.is_terminal(world):
+            return None
         target_id = action.args.get("target_id")
         if action.actor_id not in world.npcs or target_id not in world.npcs:
             return None
 
         target_location = world.npcs[str(target_id)].current_location
+        move_args = {"actor_id": action.actor_id, "location_id": target_location}
+        for metadata_key in ("episode_id", "causal_claim_id"):
+            if metadata_key in action.args:
+                move_args[metadata_key] = action.args[metadata_key]
         move_action_id = world.enqueue_action(
             actor_id=action.actor_id,
             tool_name="npc_move_to",
-            args={"actor_id": action.actor_id, "location_id": target_location},
+            args=move_args,
             priority=action.priority + 1,
             execute_after_minute=world.world_minute + self.config.fallback_move_delay_minutes,
             expires_at_minute=world.world_minute + 30,
@@ -271,7 +291,14 @@ class VillageDirector:
             world,
             actor_id="mira",
             tool_name="npc_talk_to",
-            args={"actor_id": "mira", "target_id": "tomo", "topic": "missing_seeds"},
+            args={
+                "actor_id": "mira",
+                "target_id": "tomo",
+                "topic": "missing_seeds",
+                "episode_id": "evt_missing_seeds",
+                "social_act": "careful_confrontation",
+                "causal_claim_id": "tomo_took_seeds",
+            },
         ):
             return None
 
@@ -279,7 +306,12 @@ class VillageDirector:
         move_action_id = world.enqueue_action(
             actor_id="mira",
             tool_name="npc_move_to",
-            args={"actor_id": "mira", "location_id": tomo_location},
+            args={
+                "actor_id": "mira",
+                "location_id": tomo_location,
+                "episode_id": "evt_missing_seeds",
+                "causal_claim_id": "tomo_took_seeds",
+            },
             priority=8,
             execute_after_minute=world.world_minute,
             expires_at_minute=world.world_minute + 30,
@@ -290,7 +322,14 @@ class VillageDirector:
         talk_action_id = world.enqueue_action(
             actor_id="mira",
             tool_name="npc_talk_to",
-            args={"actor_id": "mira", "target_id": "tomo", "topic": "missing_seeds"},
+            args={
+                "actor_id": "mira",
+                "target_id": "tomo",
+                "topic": "missing_seeds",
+                "episode_id": "evt_missing_seeds",
+                "social_act": "careful_confrontation",
+                "causal_claim_id": "tomo_took_seeds",
+            },
             priority=8,
             execute_after_minute=world.world_minute + self.config.fallback_retry_delay_minutes,
             expires_at_minute=world.world_minute + world.agent_runtime.ttl_minutes,

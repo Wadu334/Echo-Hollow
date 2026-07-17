@@ -3,11 +3,32 @@ extends SceneTree
 var failures: Array[String] = []
 
 
+class FakeWorldConnection:
+	extends Node
+	var connection_status := "Online"
+	var contextual_request: Dictionary = {}
+	var npc_request := ""
+
+	func send_activate_contextual_action(action_id: String, offer_version: int) -> bool:
+		contextual_request = {
+			"action_id": action_id,
+			"offer_version": offer_version,
+		}
+		return true
+
+	func send_interact_npc(npc_id: String) -> bool:
+		npc_request = npc_id
+		return true
+
+
 func _init() -> void:
 	call_deferred("_run")
 
 
 func _run() -> void:
+	var presenter = root.get_node_or_null("WorldPresenter")
+	if presenter != null:
+		presenter.reset_for_fresh_world()
 	var scene := load("res://scenes/main.tscn")
 	if scene == null:
 		_fail("Could not load main scene.")
@@ -94,6 +115,80 @@ func _run() -> void:
 		main.actor_nodes["mira"].position.distance_to(main.LOCATION_CENTERS["workshop"]) < 1.0,
 		"Expected world_state to snap Mira to the authoritative Workshop."
 	)
+	_expect("The Missing Seed Pouch" in main.event_label.text, "Expected server event_title to be visible.")
+	_expect("Gathering Clues" in main.event_label.text, "Expected server event_phase_text to be visible.")
+	_expect("Neighbors are comparing clues." in main.event_label.text, "Expected server village_flow_text to be visible.")
+	main._update_status_label()
+	_expect("Ask Ivo" in main.objective_label.text, "Expected the server objective to be visible.")
+
+	var mira_bubble_label: Label = main.actor_nodes["mira"].get_node("StateBubble/StateLabel")
+	_expect("mem 0" in mira_bubble_label.text, "Expected an empty grouped Mira memory list to show mem 0.")
+	var memory_state := _world_state()
+	memory_state["memories"]["mira"] = [
+		{
+			"memory_id": "mem_mira_claim",
+			"owner_id": "mira",
+			"type": "rumor",
+		},
+	]
+	main._apply_server_message({"type": "world_state", "data": memory_state})
+	await process_frame
+	_expect("mem 1" in mira_bubble_label.text, "Expected grouped Mira memories to increase the visible bubble count.")
+
+	for objective in [
+		"Ask Ivo about the missing seeds",
+		"Tell Mira what Ivo said",
+		"Check the Warehouse",
+		"Show Mira the evidence",
+		"Observe the outcome",
+	]:
+		var objective_state := _world_state()
+		objective_state["presentation"]["objective"] = objective
+		main._apply_server_message({"type": "world_state", "data": objective_state})
+		main._update_status_label()
+		_expect(objective in main.objective_label.text, "Expected objective step '%s' to be visible." % objective)
+
+	var contextual_state := _world_state()
+	contextual_state["player"]["current_location"] = "warehouse"
+	contextual_state["presentation"]["contextual_action"] = {
+		"action_id": "inspect_torn_seed_bag",
+		"offer_version": 3,
+		"label": "Inspect the torn seed bag",
+		"prompt": "Press E to inspect the torn seed bag",
+		"location_id": "warehouse",
+	}
+	main._apply_server_message({"type": "world_state", "data": contextual_state})
+	await process_frame
+	var fake_connection := FakeWorldConnection.new()
+	main.world_connection = fake_connection
+	main.connected = true
+	_expect(main.contextual_marker_nodes["warehouse"].visible, "Expected the offered Warehouse clue to have a visible marker.")
+	main._update_approach_prompt()
+	_expect(not main.approach_label.visible, "Expected no clue prompt while far from the specific Warehouse marker.")
+	main.player_body.position = main.CONTEXTUAL_ACTION_ANCHORS["warehouse"]
+	main._update_approach_prompt()
+	_expect(main.approach_label.visible, "Expected a Warehouse contextual prompt near the specific clue.")
+	_expect("inspect the torn seed bag" in main.approach_label.text, "Expected the contextual prompt to name the exact action.")
+	main.actor_nodes["ivo"].position = main.CONTEXTUAL_ACTION_ANCHORS["warehouse"] + Vector2(30, 0)
+	_expect(
+		str(main._current_interaction().get("kind", "")) == "contextual_action",
+		"Expected the closer clue to win when clue and NPC are both candidates."
+	)
+	main.player_body.position = main.actor_nodes["ivo"].position
+	_expect(
+		str(main._current_interaction().get("kind", "")) == "npc",
+		"Expected the closer NPC to win when clue and NPC are both candidates."
+	)
+	main.player_body.position = main.CONTEXTUAL_ACTION_ANCHORS["warehouse"]
+	main._activate_current_interaction()
+	_expect(
+		fake_connection.contextual_request == {"action_id": "inspect_torn_seed_bag", "offer_version": 3},
+		"Expected E to submit only the server-offered contextual action token."
+	)
+	main.connected = false
+	main.world_connection = null
+	fake_connection.free()
+	main._apply_server_message({"type": "world_state", "data": _world_state()})
 
 	main._apply_server_message({
 		"type": "dialogue_opened",
@@ -260,6 +355,7 @@ func _run() -> void:
 	)
 
 	_expect(load("res://scenes/rumor_consequence.tscn") != null, "Expected the independent rumor consequence scene.")
+	_expect(root.has_node("WorldPresenter"), "Expected the persistent WorldPresenter autoload.")
 	_expect(root.has_node("WorldConnection"), "Expected the persistent WorldConnection autoload.")
 	var connection = root.get_node("WorldConnection")
 	var duplicate_diff := _world_state()
@@ -274,12 +370,153 @@ func _run() -> void:
 	connection.client_session_id = "session_stale"
 	connection.active_dialogue = {"conversation_id": "conv_stale"}
 	connection.processed_event_log_ids["event_000001"] = true
-	connection.rumor_consequence_payload = {"line": "stale"}
+	connection.rumor_consequence_payload = {"presentation_id": "outcome_stale", "line": "stale"}
+	connection.last_consumed_event_cursor = 42
 	connection._reset_session_state()
 	_expect(connection.client_session_id == "", "Expected reconnect reset to clear the old client session id.")
 	_expect(connection.active_dialogue.is_empty(), "Expected reconnect reset to clear stale dialogue state.")
-	_expect(connection.processed_event_log_ids.is_empty(), "Expected reconnect reset to clear event dedup state.")
-	_expect(connection.rumor_consequence_payload.is_empty(), "Expected reconnect reset to clear stale consequence data.")
+	_expect(connection.processed_event_log_ids.has("event_000001"), "Expected transient reconnect to retain event dedup state.")
+	_expect(not connection.rumor_consequence_payload.is_empty(), "Expected transient reconnect to retain pending consequence data.")
+	_expect(connection.last_consumed_event_cursor == 42, "Expected transient reconnect to retain the consumed cursor.")
+	_expect("after_cursor=42" in connection._connection_url(), "Expected reconnect URL to request cursor catch-up.")
+	connection.manual_disconnect_requested = false
+	connection.reconnect_attempt = 8
+	connection._schedule_reconnect()
+	_expect(connection.connection_status == "Reconnecting", "Expected an explicit Reconnecting status.")
+	_expect(
+		connection.reconnect_delay_remaining <= connection.RECONNECT_MAX_DELAY_SECONDS,
+		"Expected exponential reconnect delay to be capped."
+	)
+	connection.reconnect_scheduled = false
+	connection.manual_disconnect_requested = true
+	connection.set_process(false)
+	main.world_connection = connection
+	for status in ["Connecting", "Reconnecting", "Offline"]:
+		connection._set_connection_status(status)
+		main._update_status_label()
+		_expect(status in main.status_label.text, "Expected visible %s connection status." % status)
+	main.world_connection = null
+	connection._reset_session_state(true)
+	connection.has_authoritative_snapshot = true
+	connection.has_ever_connected = true
+	connection.recovery_in_progress = true
+	connection.last_consumed_event_cursor = 10
+	connection._set_connection_status("Reconnecting")
+	connection._apply_server_message({
+		"type": "recovery_events",
+		"from_cursor": 10,
+		"to_cursor": 11,
+		"has_more": true,
+		"events": _recovery_events(10, 1),
+	})
+	var premature_snapshot := _world_state()
+	premature_snapshot["event_log_cursor"] = 12
+	connection._apply_server_message({
+		"type": "world_state",
+		"client_session_id": "session_incomplete_recovery",
+		"recovery_events": [],
+		"data": premature_snapshot,
+	})
+	_expect(not connection.connected, "Expected a snapshot with a recovery cursor gap not to become Online.")
+	_expect(connection.connection_status == "Reconnecting", "Expected incomplete recovery to remain Reconnecting.")
+	_expect(connection.last_consumed_event_cursor == 11, "Expected incomplete recovery not to jump to the snapshot cursor.")
+
+	connection._reset_session_state(true)
+	connection.has_authoritative_snapshot = true
+	connection.has_ever_connected = true
+	connection.recovery_in_progress = true
+	connection.last_consumed_event_cursor = 10
+	connection._set_connection_status("Reconnecting")
+	connection._apply_server_message({
+		"type": "recovery_events",
+		"from_cursor": 10,
+		"to_cursor": 510,
+		"has_more": true,
+		"events": _recovery_events(10, 500),
+	})
+	_expect(connection.last_consumed_event_cursor == 510, "Expected the first recovery page cursor to be consumed exactly.")
+	_expect(not connection.connected, "Expected a partial recovery page not to become Online.")
+	connection._apply_server_message({
+		"type": "recovery_events",
+		"from_cursor": 510,
+		"to_cursor": 611,
+		"has_more": false,
+		"events": _recovery_events(510, 101),
+	})
+	_expect(connection.last_consumed_event_cursor == 611, "Expected the final recovery page cursor to be consumed exactly.")
+	_expect(connection.last_recovery_event_count == 601, "Expected recovery pages to accumulate all 601 events.")
+	var complete_snapshot := _world_state()
+	complete_snapshot["event_log_cursor"] = 611
+	connection._apply_server_message({
+		"type": "world_state",
+		"client_session_id": "session_complete_recovery",
+		"recovery_events": [],
+		"data": complete_snapshot,
+	})
+	_expect(connection.connected, "Expected a fully caught-up recovery snapshot to become Online.")
+	_expect(connection.connection_status == "Online", "Expected complete paged recovery to restore Online.")
+	_expect(connection.last_consumed_event_cursor == 611, "Expected snapshot application not to skip the recovered cursor.")
+
+	connection.pending_presentation_ack_ids = {
+		"pres_still_pending": true,
+		"pres_already_removed": true,
+	}
+	connection.world_data = {
+		"pending_presentations": [
+			{"presentation_id": "pres_still_pending"},
+		],
+	}
+	connection._reconcile_pending_presentation_acks()
+	_expect(
+		connection.pending_presentation_ack_ids.has("pres_still_pending"),
+		"Expected an unconfirmed server presentation ack to remain queued."
+	)
+	_expect(
+		not connection.pending_presentation_ack_ids.has("pres_already_removed"),
+		"Expected snapshot reconciliation to retire an ack already applied by the server."
+	)
+
+	if presenter != null:
+		presenter.reset_for_fresh_world()
+		presenter.ingest_authoritative_events([
+			{
+				"event_log_id": "elog_without_presentation",
+				"type": "npc_dialogue_started",
+				"actor_id": "mira",
+				"target_id": "tomo",
+				"payload": {"topic": "missing_seeds"},
+			},
+		])
+		_expect(
+			not presenter.has_pending_consequence(),
+			"Expected a bare authority event without a server presentation payload not to synthesize a consequence."
+		)
+		var outcome := {
+			"presentation_id": "pres_reconciled_001",
+			"type": "reconciliation_consequence",
+			"title": "The Evidence Clears Tomo",
+			"line": "The torn seam shows the pouch broke near the Warehouse.",
+			"reaction_text": "Tomo exhales as the suspicion lifts.",
+			"relationship_trend_text": "Mira and Tomo begin rebuilding trust.",
+			"reflection_text": "Mira resolves to check evidence before repeating a claim.",
+			"path": "reconciled",
+			"event_log_id": "elog_000099",
+		}
+		_expect(presenter.enqueue_consequence(outcome), "Expected a valid server outcome to queue for presentation.")
+		_expect(not presenter.enqueue_consequence(outcome), "Expected the same presentation_id to deduplicate.")
+		var consequence_scene = load("res://scenes/rumor_consequence.tscn").instantiate()
+		root.add_child(consequence_scene)
+		await process_frame
+		_expect(_node_text_contains(consequence_scene, "The Evidence Clears Tomo"), "Expected server outcome title in the consequence scene.")
+		_expect(_node_text_contains(consequence_scene, "suspicion lifts"), "Expected server reaction text in the consequence scene.")
+		_expect(_node_text_contains(consequence_scene, "rebuilding trust"), "Expected a relationship trend instead of exact values.")
+		_expect(not _node_text_contains(consequence_scene, "trust 0."), "Expected normal consequence UI to hide exact relationship values.")
+		consequence_scene.queue_free()
+		await process_frame
+		presenter.acknowledge_consequence("pres_reconciled_001")
+		_expect(not presenter.enqueue_consequence(outcome), "Expected an acknowledged outcome to remain exactly-once.")
+
+	connection._reset_session_state(true)
 
 	if not failures.is_empty():
 		for failure in failures:
@@ -311,6 +548,12 @@ func _world_state() -> Dictionary:
 			"tomo": _npc("tomo", "Tomo", "farm", "guarded"),
 			"ivo": _npc("ivo", "Ivo", "square", "warm"),
 		},
+		"memories": {
+			"mira": [],
+			"tomo": [],
+			"ivo": [],
+		},
+		"rumors": {},
 		"latest_events": [
 			{
 				"world_time": "day 1 08:00",
@@ -318,9 +561,28 @@ func _world_state() -> Dictionary:
 			},
 		],
 		"presentation": {
-			"event_phase_text": "Gathering clues",
+			"event_title": "The Missing Seed Pouch",
+			"event_phase_text": "Gathering Clues",
+			"village_flow_text": "Neighbors are comparing clues.",
+			"objective": "Ask Ivo about the missing seeds",
+			"contextual_action": null,
+			"toasts": [],
 		},
+		"pending_presentations": [],
 	}
+
+
+func _recovery_events(from_cursor: int, count: int) -> Array:
+	var events: Array = []
+	for offset in count:
+		events.append({
+			"event_log_id": "elog_recovery_%06d" % (from_cursor + offset + 1),
+			"type": "recovery_probe",
+			"actor_id": null,
+			"target_id": null,
+			"payload": {"offset": offset},
+		})
+	return events
 
 
 func _location(location_id: String, label: String, x: int, y: int) -> Dictionary:
@@ -349,6 +611,13 @@ func _npc(npc_id: String, label: String, location_id: String, mood: String) -> D
 func _expect(condition: bool, message: String) -> void:
 	if not condition:
 		failures.append(message)
+
+
+func _node_text_contains(node: Node, fragment: String) -> bool:
+	for child in node.find_children("*", "Label", true, false):
+		if fragment in str(child.text):
+			return true
+	return false
 
 
 func _fail(message: String) -> void:

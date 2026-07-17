@@ -89,6 +89,35 @@ class ProtocolTests(unittest.TestCase):
             30,
         )
 
+    def test_contextual_action_and_presentation_ack_require_strict_fields(self) -> None:
+        self.assertEqual(
+            validate_client_payload(
+                {
+                    "type": "activate_contextual_action",
+                    "action_id": "inspect_torn_seed_bag_clue",
+                    "offer_version": 1,
+                }
+            )["offer_version"],
+            1,
+        )
+        self.assertEqual(
+            validate_client_payload(
+                {
+                    "type": "ack_presentation",
+                    "presentation_id": "presentation_1",
+                }
+            )["presentation_id"],
+            "presentation_1",
+        )
+        for payload, field in [
+            ({"type": "activate_contextual_action", "action_id": "x"}, "offer_version"),
+            ({"type": "ack_presentation", "presentation_id": 1}, "presentation_id"),
+        ]:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ProtocolError) as context:
+                    validate_client_payload(payload)
+                self.assertEqual(context.exception.field, field)
+
     def test_legacy_dialogue_choice_is_explicitly_rejected(self) -> None:
         with self.assertRaises(ProtocolError) as context:
             validate_client_payload(
@@ -142,6 +171,60 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(websocket.messages[0]["type"], "world_state")
         self.assertEqual(websocket.messages[0]["client_session_id"], client_session_id)
         self.assertTrue(client_session_id.startswith("session_"))
+        self.assertEqual(websocket.messages[0]["recovery_events"], [])
+
+    def test_connect_after_cursor_returns_recovery_events_before_snapshot_consumption(self) -> None:
+        world = WorldSimulation()
+        cursor = world.snapshot()["event_log_cursor"]
+        world.move_player("tavern")
+        hub = CapturingHub(world)
+        websocket = FakeWebSocket()
+
+        asyncio.run(hub.connect(websocket, after_cursor=cursor))
+
+        recovery = websocket.messages[0]
+        state = websocket.messages[1]
+        self.assertEqual(recovery["type"], "recovery_events")
+        self.assertEqual(recovery["from_cursor"], cursor)
+        self.assertEqual(recovery["to_cursor"], cursor + 1)
+        self.assertFalse(recovery["has_more"])
+        self.assertEqual(recovery["events"][0]["type"], "player_moved")
+        self.assertEqual(state["type"], "world_state")
+        self.assertEqual(state["recovery_events"], [])
+        self.assertEqual(state["data"]["event_log_cursor"], world.snapshot()["event_log_cursor"])
+
+    def test_connect_pages_more_than_five_hundred_recovery_events_without_a_cursor_gap(self) -> None:
+        world = WorldSimulation()
+        cursor = world.snapshot()["event_log_cursor"]
+        for index in range(1201):
+            world._append_event(
+                event_type="recovery_probe",
+                actor_id=None,
+                target_id=None,
+                payload={"index": index},
+            )
+        snapshot_cursor = world.snapshot()["event_log_cursor"]
+        hub = CapturingHub(world)
+        websocket = FakeWebSocket()
+
+        asyncio.run(hub.connect(websocket, after_cursor=cursor))
+
+        pages = websocket.messages[:-1]
+        state = websocket.messages[-1]
+        self.assertEqual([len(page["events"]) for page in pages], [500, 500, 201])
+        self.assertEqual([page["has_more"] for page in pages], [True, True, False])
+        expected_from = cursor
+        recovered_indexes: list[int] = []
+        for page in pages:
+            self.assertEqual(page["type"], "recovery_events")
+            self.assertEqual(page["from_cursor"], expected_from)
+            self.assertEqual(page["to_cursor"], expected_from + len(page["events"]))
+            expected_from = page["to_cursor"]
+            recovered_indexes.extend(event["payload"]["index"] for event in page["events"])
+        self.assertEqual(expected_from, snapshot_cursor)
+        self.assertEqual(recovered_indexes, list(range(1201)))
+        self.assertEqual(state["type"], "world_state")
+        self.assertEqual(state["data"]["event_log_cursor"], snapshot_cursor)
 
     def test_disconnect_closes_that_sessions_open_conversation(self) -> None:
         world = WorldSimulation()

@@ -51,7 +51,13 @@ class AgentV1EpisodeTests(unittest.TestCase):
         world.enqueue_action(
             actor_id="mira",
             tool_name="npc_talk_to",
-            args={"actor_id": "mira", "target_id": "tomo", "topic": "missing_seeds"},
+            args={
+                "actor_id": "mira",
+                "target_id": "tomo",
+                "topic": "missing_seeds",
+                "episode_id": "evt_missing_seeds",
+                "social_act": "check_in",
+            },
             priority=5,
             reason="talk to Tomo",
         )
@@ -150,9 +156,11 @@ class AgentV1EpisodeTests(unittest.TestCase):
         self.assertLess(snapshot["relationships"]["tomo->mira"]["trust"], 0.5)
         self.assertIn("falsely_accused", snapshot["npcs"]["tomo"]["status_flags"])
 
-    def test_reflection_changes_mira_future_rumor_response(self) -> None:
+    def test_reflection_does_not_reopen_resolved_episode(self) -> None:
         world = self._run_reconciled_path()
-        world.share_claim(target_id="mira", claim_id="tomo_took_seeds")
+        queue_size = len(world.action_queue)
+
+        rejected = world.share_claim(target_id="mira", claim_id="tomo_took_seeds")
         queued_investigations = [
             action
             for action in world.snapshot()["action_queue"]
@@ -160,8 +168,9 @@ class AgentV1EpisodeTests(unittest.TestCase):
         ]
 
         self.assertIn("rumor_skepticism", world.npcs["mira"].behavior_modifiers)
-        self.assertTrue(queued_investigations)
-        self.assertEqual(queued_investigations[-1]["args"]["subject_id"], "warehouse")
+        self.assertEqual(rejected["reason"], "episode_terminal")
+        self.assertEqual(queued_investigations, [])
+        self.assertEqual(len(world.action_queue), queue_size)
 
     def test_ai_gateway_deterministic_provider_returns_valid_schema(self) -> None:
         provider = DeterministicAIProvider()
